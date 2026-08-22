@@ -1,5 +1,8 @@
 import { addActivity, getActivityLog } from './activityStore.js';
 import { callBitrixMethod, listBitrixMethod } from './bitrixClient.js';
+import { env } from '../config/env.js';
+import { parsePurposeV2 } from './purposePatternsV2.js';
+import { canonicalize, canonicalizeNumeric, smartFindValue } from './smartMatch.js';
 import { normalizeBankTransaction } from './transactionValidation.js';
 
 const TYPES = {
@@ -30,7 +33,7 @@ const TYPES = {
     stages: {
       unpaid: 'DT1052_33:NEW',
       partial: 'DT1052_33:PREPARATION',
-      paid: 'DT1052_33:SUCCESS'
+      paid: 'DT1052_33:CLIENT'
     },
     fields: {
       firstName: 'ufCrm17_1784111700810',
@@ -58,6 +61,9 @@ const DEAL_FIELDS = {
   categoryId: 'CATEGORY_ID',
   contactId: 'CONTACT_ID',
   receiptIds: 'UF_CRM_1785744431',
+  scheduleIds: 'UF_CRM_1785062378',
+  balance: 'UF_CRM_1776322253480',
+  paidTotal: 'UF_CRM_1776609678581',
   buyerName: 'UF_CRM_1716720255166',
   apartmentChecked: 'UF_CRM_1776254518',
   apartmentNumber: 'UF_CRM_65BE4878488D4',
@@ -93,6 +99,7 @@ const MIN_DOCUMENT_PREFIX_LENGTH = 6;
 const MAX_CONTACT_LOOKUPS = 25;
 const CONTACT_MATCH_SCORE = 110;
 const receiptImportLocks = new Map();
+const matchLocks = new Map();
 let stagesPromise = null;
 
 // Payment purposes arrive from several banks and are commonly typed with compact Armenian,
@@ -153,6 +160,10 @@ async function getStages() {
 
 async function loadStages() {
   const stages = getDefaultStages();
+
+  if (!env.BITRIX_REFRESH_STAGE_IDS) {
+    return stages;
+  }
 
   try {
     const statuses = await listBitrixMethod('crm.status.list', {
@@ -231,7 +242,7 @@ export async function listReceipts() {
   }));
   const receipts = voucherResponse.items.map((item) => mapVoucherData(item, stages));
   const contactDealsByDocument = await loadContactDealsByDocument(receipts, deals);
-  const suggestionContext = { deals, contactDealsByDocument, stages };
+  const suggestionContext = { deals, contactDealsByDocument, receipts, stages };
   const vouchers = receipts.map((receipt) => ({
     ...receipt,
     suggestions: receipt.status === 'unmatched' ? getSuggestions(receipt, schedules, suggestionContext) : []
@@ -311,12 +322,49 @@ export async function listBuildingOptions() {
   return BUILDING_OPTIONS;
 }
 
-export async function confirmMatch({ receiptId, dealId, scheduleIds = [] }) {
+export async function confirmMatch(payload) {
+  const receiptId = String(payload.receiptId);
+  const dealId = String(payload.dealId);
+  const previous = matchLocks.get(receiptId);
+
+  if (previous) {
+    return previous.promise.then((result) => {
+      if (String(result.matchedDealId) === dealId) {
+        return { ...result, alreadyProcessing: true };
+      }
+
+      return confirmMatchOnce(payload);
+    });
+  }
+
+  const matchPromise = confirmMatchOnce(payload).finally(() => {
+    matchLocks.delete(receiptId);
+  });
+  matchLocks.set(receiptId, { dealId, promise: matchPromise });
+  return matchPromise;
+}
+
+async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
   const [stages, deal, receipt] = await Promise.all([
     getStages(),
     getBitrixDeal(dealId),
     getBitrixVoucher(receiptId)
   ]);
+
+  if (isAlreadyMatchedWithDeal(receipt, dealId, stages)) {
+    const receiptIds = appendUniqueId(deal?.[DEAL_FIELDS.receiptIds], receiptId);
+    await syncVoucherAmountFields(receiptId, receipt);
+    const recalculation = await recalculateDealSchedules(deal, stages, receiptIds);
+
+    return {
+      id: receiptId,
+      matchedDealId: dealId,
+      matchedScheduleIds: scheduleIds,
+      recalculation,
+      alreadyMatched: true
+    };
+  }
+
   assertMatchEntities({ deal, receipt, dealId, stages });
   await validateSelectedSchedules(scheduleIds, dealId, stages);
 
@@ -327,11 +375,8 @@ export async function confirmMatch({ receiptId, dealId, scheduleIds = [] }) {
   let receiptUpdated = false;
 
   try {
-    await callBitrixMethod('crm.deal.update', {
-      id: dealId,
-      fields: {
-        [DEAL_FIELDS.receiptIds]: receiptIds
-      }
+    await updateDealFields(dealId, {
+      [DEAL_FIELDS.receiptIds]: receiptIds
     });
     dealUpdated = true;
 
@@ -341,12 +386,13 @@ export async function confirmMatch({ receiptId, dealId, scheduleIds = [] }) {
       fields: {
         stageId: stages.voucher.matched,
         parentId2: dealId,
+        ...getVoucherAmountFields(receipt),
         ...(contactId ? { contactId } : {})
       }
     });
     receiptUpdated = true;
 
-    const recalculation = await recalculateDealSchedules(dealId, stages, receiptIds);
+    const recalculation = await recalculateDealSchedules(deal, stages, receiptIds);
     await addActivity({
       receiptId,
       action: `Receipt matched with Deal #${dealId}; schedules recalculated`,
@@ -374,9 +420,8 @@ export async function confirmMatch({ receiptId, dealId, scheduleIds = [] }) {
       }).catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
     if (dealUpdated) {
-      await callBitrixMethod('crm.deal.update', {
-        id: dealId,
-        fields: { [DEAL_FIELDS.receiptIds]: previousReceiptIds }
+      await updateDealFields(dealId, {
+        [DEAL_FIELDS.receiptIds]: previousReceiptIds
       }).catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
 
@@ -385,6 +430,10 @@ export async function confirmMatch({ receiptId, dealId, scheduleIds = [] }) {
     }
     throw error;
   }
+}
+
+function isAlreadyMatchedWithDeal(receipt, dealId, stages) {
+  return String(receipt?.parentId2 ?? '') === String(dealId) && receipt?.stageId === stages.voucher.matched;
 }
 
 async function listBitrixVouchers() {
@@ -458,7 +507,7 @@ function mapVoucherData(item, stages) {
     paymentDate: item[TYPES.voucher.fields.paymentDate],
     status: item.stageId === stages.voucher.new ? 'unmatched' : 'matched',
     matchedDealId: item.parentId2 ? String(item.parentId2) : null,
-    parsed: parsePurpose(purpose)
+    parsed: env.SMART_MATCH_V2 ? parsePurposeV2(purpose) : parsePurpose(purpose)
   };
 }
 
@@ -484,84 +533,149 @@ function mapSchedule(item) {
 }
 
 function getSuggestions(receipt, schedules, context) {
-  const payableSchedules = schedules.filter((schedule) => schedule.dealId && isPayableSchedule(schedule, context.stages));
-  const purposeNeedle = normalize(receipt.purpose);
-  const exactAmount = payableSchedules.filter((schedule) => amountMatches(schedule, receipt.amount));
-  const byPurpose = payableSchedules.filter((schedule) => purposeMatchesSchedule(receipt, schedule, purposeNeedle));
-  const byPayer = payableSchedules.filter((schedule) => {
-    if (!receipt.payerName || normalize(receipt.payerName).length < 3 || !schedule.buyerName) {
-      return false;
-    }
-
-    return namesOverlap(receipt.payerName, schedule.buyerName);
-  });
-
-  const scheduleSuggestions = uniqueSchedules([...byPurpose, ...exactAmount, ...byPayer])
-    .slice(0, 10)
-    .map((schedule) => ({
-      deal: {
-        id: schedule.dealId,
-        buyerName: schedule.deal?.buyerName || schedule.buyerName || `Deal #${schedule.dealId}`,
-        address: schedule.deal?.title || schedule.title,
-        schedules: [schedule]
-      },
-      scheduleIds: [schedule.id],
-      score: getSuggestionScore(receipt, schedule),
-      label: getSuggestionLabel(receipt, schedule),
-      reason: `${schedule.title} / ${formatDate(schedule.paymentDate)}`
-    }))
-    .sort((a, b) => b.score - a.score);
   const documentPrefix = getDocumentPrefix(receipt.payerDocument);
   const contactDeals = context.contactDealsByDocument.get(documentPrefix) ?? [];
   const contactDealIds = new Set(contactDeals.map((deal) => deal.id));
-  const scheduleIdsByContactDeal = new Map();
 
-  for (const suggestion of scheduleSuggestions) {
-    if (!contactDealIds.has(suggestion.deal.id)) continue;
-    scheduleIdsByContactDeal.set(suggestion.deal.id, [
-      ...(scheduleIdsByContactDeal.get(suggestion.deal.id) ?? []),
-      ...suggestion.scheduleIds
-    ]);
-  }
+  const contactSuggestions = contactDeals.map((deal) => {
+      const dealSchedules = getDealSchedules(deal, schedules, context.stages);
+      const allDealSchedules = getAllDealSchedules(deal, schedules);
 
-  const contactSuggestions = contactDeals.map((deal) => ({
-    deal: {
-      id: deal.id,
-      buyerName: deal.buyerName,
-      address: deal.address,
-      schedules: schedules
-        .filter((schedule) => schedule.dealId === deal.id && isPayableSchedule(schedule, context.stages))
-        .slice(0, 3)
-    },
-    scheduleIds: [...new Set(scheduleIdsByContactDeal.get(deal.id) ?? [])],
-    score: CONTACT_MATCH_SCORE + getDirectDealScore(receipt, deal) - 70,
-    label: 'Contact Match',
-    reason: 'Payer document matched a Bitrix contact'
-  }));
-  const otherScheduleSuggestions = scheduleSuggestions.filter((suggestion) => !contactDealIds.has(suggestion.deal.id));
-  const usedDealIds = new Set([
-    ...otherScheduleSuggestions.map((suggestion) => suggestion.deal.id),
-    ...contactDealIds
-  ]);
+      return {
+        deal: buildSuggestionDeal(deal, allDealSchedules, context.receipts, context.stages),
+        scheduleIds: dealSchedules.map((schedule) => schedule.id),
+        score: CONTACT_MATCH_SCORE + getDirectDealScore(receipt, deal) - 70,
+        label: 'Contact Match',
+        reason: 'Payer document matched a Bitrix contact'
+      };
+  });
   const directDealSuggestions = context.deals
+    .filter((deal) => !contactDealIds.has(deal.id))
     .filter((deal) => dealMatchesReceipt(receipt, deal))
-    .filter((deal) => !usedDealIds.has(deal.id))
-    .map((deal) => ({
-      deal: {
-        id: deal.id,
-        buyerName: deal.buyerName,
-        address: deal.address,
-        schedules: []
-      },
-      scheduleIds: [],
-      score: getDirectDealScore(receipt, deal),
-      label: 'Deal Match',
-      reason: deal.title
-    }));
+    .map((deal) => {
+      const dealSchedules = getDealSchedules(deal, schedules, context.stages);
+      const allDealSchedules = getAllDealSchedules(deal, schedules);
 
-  return [...contactSuggestions, ...otherScheduleSuggestions, ...directDealSuggestions]
+      return {
+        deal: buildSuggestionDeal(deal, allDealSchedules, context.receipts, context.stages),
+        scheduleIds: dealSchedules.map((schedule) => schedule.id),
+        score: getDirectDealScore(receipt, deal),
+        label: 'Deal Match',
+        reason: deal.title
+      };
+    });
+
+  return [...contactSuggestions, ...directDealSuggestions]
     .sort((a, b) => b.score - a.score)
     .slice(0, 10);
+}
+
+function buildSuggestionDeal(deal, schedules = [], receipts = [], stages = getDefaultStages()) {
+  const linkedReceiptIds = new Set(deal.receiptIds ?? []);
+  const linkedReceipts = receipts
+    .filter((receipt) => receipt.matchedDealId === deal.id || linkedReceiptIds.has(receipt.id))
+    .filter((receipt) => receipt.currency === 'AMD' || receipt.currencyEnum === CURRENCY_ENUM.AMD)
+    .sort((left, right) => {
+      const leftDate = getReceiptSortTime(left);
+      const rightDate = getReceiptSortTime(right);
+      return leftDate - rightDate || Number(left.id) - Number(right.id);
+    });
+
+  return {
+    id: deal.id,
+    title: deal.title,
+    buyerName: deal.buyerName,
+    address: deal.address,
+    amount: deal.amount,
+    currency: deal.currency,
+    contactId: deal.contactId,
+    projectId: deal.projectId,
+    projectName: BUILDING_OPTIONS.find((option) => option.value === deal.projectId)?.label ?? '',
+    buildingSectionId: deal.buildingSectionId,
+    apartmentNumber: deal.apartmentNumber,
+    floor: deal.floor,
+    area: deal.area,
+    scheduleIds: deal.scheduleIds,
+    schedules: schedules.slice(0, 100),
+    receipts: linkedReceipts.map((receipt) => ({
+      id: receipt.id,
+      title: receipt.bankTransactionId || receipt.bitrixTitle || `#${receipt.id}`,
+      amount: receipt.amount,
+      currency: receipt.currency,
+      paymentDate: receipt.paymentDate || receipt.receivedAt
+    })),
+    paymentTimeline: buildPaymentTimeline(linkedReceipts, schedules, stages)
+  };
+}
+
+function getAllDealSchedules(deal, schedules) {
+  const linkedScheduleIds = new Set(deal.scheduleIds ?? []);
+  const byDealField = schedules.filter((schedule) => linkedScheduleIds.has(schedule.id));
+  const fallbackByParent = schedules.filter((schedule) => schedule.dealId === deal.id);
+  const dealSchedules = byDealField.length ? byDealField : fallbackByParent;
+
+  return dealSchedules.sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+function buildPaymentTimeline(receipts, schedules, stages) {
+  const scheduleStates = schedules.map((schedule) => ({
+    id: schedule.id,
+    amount: Number(schedule.amount ?? 0),
+    currency: schedule.currency,
+    paymentDate: schedule.paymentDate,
+    status: schedule.status,
+    paid: 0
+  }));
+
+  return receipts.map((receipt) => {
+    let available = Number(receipt.amount ?? 0);
+    const allocations = [];
+
+    for (const schedule of scheduleStates) {
+      if (available <= 0) break;
+
+      const remainingBefore = Math.max(schedule.amount - schedule.paid, 0);
+      if (remainingBefore <= 0) continue;
+
+      const paid = Math.min(available, remainingBefore);
+      schedule.paid += paid;
+      available -= paid;
+
+      allocations.push({
+        scheduleId: schedule.id,
+        scheduleAmount: schedule.amount,
+        currency: schedule.currency,
+        paymentDate: schedule.paymentDate,
+        paid,
+        paidTotal: schedule.paid,
+        remainingBefore,
+        remainingAfter: Math.max(schedule.amount - schedule.paid, 0),
+        closed: schedule.paid >= schedule.amount,
+        statusAfter: schedule.paid >= schedule.amount ? stages.schedule.paid : stages.schedule.partial
+      });
+    }
+
+    return {
+      receiptId: receipt.id,
+      title: receipt.bankTransactionId || receipt.bitrixTitle || `#${receipt.id}`,
+      amount: receipt.amount,
+      currency: receipt.currency,
+      paymentDate: receipt.paymentDate || receipt.receivedAt,
+      allocations,
+      excess: Math.max(available, 0)
+    };
+  });
+}
+
+function getReceiptSortTime(receipt) {
+  const date = new Date(receipt.paymentDate || receipt.receivedAt || 0);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
+function getDealSchedules(deal, schedules, stages) {
+  return getAllDealSchedules(deal, schedules)
+    .filter((schedule) => isPayableSchedule(schedule, stages))
+    .sort((left, right) => Number(left.id) - Number(right.id));
 }
 
 async function loadContactDealsByDocument(receipts, deals) {
@@ -684,8 +798,13 @@ function mapDeal(deal) {
     amount: Number(deal.OPPORTUNITY ?? 0),
     currency: deal.CURRENCY_ID || 'AMD',
     contactId: String(deal[DEAL_FIELDS.contactId] ?? ''),
+    receiptIds: normalizeIdList(deal[DEAL_FIELDS.receiptIds]),
+    scheduleIds: normalizeIdList(deal[DEAL_FIELDS.scheduleIds]),
     projectId: String(deal[DEAL_FIELDS.project] ?? ''),
     buildingSectionId: String(deal[DEAL_FIELDS.buildingSection] ?? ''),
+    apartmentNumber: String(flattenValue(deal[DEAL_FIELDS.apartmentNumber])).trim(),
+    floor: String(flattenValue(deal[DEAL_FIELDS.floor])).trim(),
+    area: String(flattenValue(deal[DEAL_FIELDS.area])).trim(),
     searchableText
   };
 }
@@ -784,9 +903,8 @@ function getDealContactId(deal) {
 }
 
 function appendUniqueId(value, id) {
-  const current = Array.isArray(value) ? value : String(value ?? '').split(',');
   const normalizedId = String(id);
-  const next = current.map((item) => String(item).trim()).filter(Boolean);
+  const next = normalizeIdList(value);
 
   if (!next.includes(normalizedId)) {
     next.push(normalizedId);
@@ -795,28 +913,25 @@ function appendUniqueId(value, id) {
   return next;
 }
 
-async function recalculateDealSchedules(dealId, stages, linkedReceiptIds = []) {
-  const [vouchers, scheduleResponse] = await Promise.all([
+function normalizeIdList(value) {
+  if (value === false || value === null || value === undefined || value === '') {
+    return [];
+  }
+
+  const items = Array.isArray(value) ? value : String(value ?? '').split(',');
+
+  return items
+    .map((item) => String(flattenValue(item)).trim())
+    .filter((item) => /^\d+$/u.test(item));
+}
+
+async function recalculateDealSchedules(deal, stages, linkedReceiptIds = []) {
+  const dealId = String(deal?.ID ?? deal?.id ?? '');
+  const [vouchers, schedules] = await Promise.all([
     listDealVouchers(dealId, linkedReceiptIds),
-    listBitrixMethod('crm.item.list', {
-      entityTypeId: TYPES.schedule.entityTypeId,
-      order: { id: 'ASC' },
-      filter: {
-        categoryId: TYPES.schedule.categoryId,
-        parentId2: dealId
-      },
-      select: [
-        'id',
-        'stageId',
-        'opportunity',
-        'currencyId',
-        TYPES.schedule.fields.partialPaid,
-        TYPES.schedule.fields.remaining
-      ]
-    })
+    listDealSchedulesForRecalculation(deal)
   ]);
   const amdTotal = sumAmdVouchers(vouchers);
-  const schedules = scheduleResponse.map(mapSchedule).sort((left, right) => Number(left.id) - Number(right.id));
   const updates = planScheduleUpdates(schedules, amdTotal, stages);
   const completed = [];
   try {
@@ -824,6 +939,8 @@ async function recalculateDealSchedules(dealId, stages, linkedReceiptIds = []) {
       await updateSchedule(update.schedule.id, update.fields);
       completed.push(update.schedule);
     }
+
+    await updateDealScheduleSummary(dealId, schedules, amdTotal);
   } catch (error) {
     const rollbackErrors = [];
     for (const schedule of completed.reverse()) {
@@ -841,14 +958,131 @@ async function recalculateDealSchedules(dealId, stages, linkedReceiptIds = []) {
 
   return {
     amdTotal,
+    scheduleTotal: sumScheduleAmounts(schedules),
+    remainingTotal: sumScheduleAmounts(schedules) - amdTotal,
     updatedSchedules: updates.length
   };
+}
+
+async function listDealSchedulesForRecalculation(deal) {
+  const dealId = String(deal?.ID ?? deal?.id ?? '');
+  const scheduleIds = normalizeIdList(deal?.[DEAL_FIELDS.scheduleIds] ?? deal?.scheduleIds);
+  const filter = scheduleIds.length
+    ? { categoryId: TYPES.schedule.categoryId, '@id': scheduleIds }
+    : { categoryId: TYPES.schedule.categoryId, parentId2: dealId };
+  const items = await listBitrixMethod('crm.item.list', {
+    entityTypeId: TYPES.schedule.entityTypeId,
+    order: { id: 'ASC' },
+    filter,
+    select: [
+      'id',
+      'stageId',
+      'parentId2',
+      'opportunity',
+      'currencyId',
+      TYPES.schedule.fields.partialPaid,
+      TYPES.schedule.fields.remaining
+    ]
+  });
+
+  return items.map(mapSchedule).sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+async function updateDealScheduleSummary(dealId, schedules, amdTotal) {
+  const fields = getDealScheduleSummaryFields(schedules, amdTotal);
+
+  const result = await updateDealFields(dealId, fields);
+  const persisted = await getDealFields(dealId);
+
+  assertDealScheduleSummaryPersisted(persisted, fields);
+
+  return result;
+}
+
+export function getDealScheduleSummaryFields(schedules, amdTotal) {
+  const scheduleTotal = sumScheduleAmounts(schedules);
+
+  return {
+    [DEAL_FIELDS.scheduleIds]: schedules.map((schedule) => schedule.id),
+    [DEAL_FIELDS.balance]: formatMoneyField(scheduleTotal - amdTotal),
+    [DEAL_FIELDS.paidTotal]: formatMoneyField(amdTotal)
+  };
+}
+
+function updateDealFields(dealId, fields) {
+  return callBitrixMethod('crm.item.update', {
+    entityTypeId: 2,
+    id: dealId,
+    useOriginalUfNames: 'Y',
+    fields
+  });
+}
+
+async function getDealFields(dealId) {
+  const result = await callBitrixMethod('crm.item.get', {
+    entityTypeId: 2,
+    id: dealId,
+    useOriginalUfNames: 'Y'
+  });
+
+  return result?.item ?? {};
+}
+
+export function assertDealScheduleSummaryPersisted(deal, expectedFields) {
+  const mismatches = [DEAL_FIELDS.balance, DEAL_FIELDS.paidTotal].filter(
+    (field) => normalizeMoneyField(deal?.[field]) !== normalizeMoneyField(expectedFields?.[field])
+  );
+
+  if (mismatches.length) {
+    const error = new Error(
+      `Bitrix automation overwrote deal summary fields after save: ${mismatches.join(', ')}`
+    );
+    error.status = 409;
+    error.code = 'BITRIX_AUTOMATION_CONFLICT';
+    throw error;
+  }
+}
+
+function normalizeMoneyField(value) {
+  const [amount = '0', currency = 'AMD'] = String(value ?? '').split('|');
+  return `${Number(amount) || 0}|${String(currency || 'AMD').toUpperCase()}`;
+}
+
+function sumScheduleAmounts(schedules) {
+  return schedules.reduce((sum, schedule) => sum + Number(schedule.amount ?? 0), 0);
+}
+
+function formatMoneyField(amount, currency = 'AMD') {
+  return `${Number(amount ?? 0)}|${currency}`;
 }
 
 export function sumAmdVouchers(vouchers) {
   return vouchers
     .filter((voucher) => isAmdVoucher(voucher))
-    .reduce((sum, voucher) => sum + Number(voucher[TYPES.voucher.fields.amount] ?? voucher.opportunity ?? 0), 0);
+    .reduce((sum, voucher) => sum + getVoucherAmount(voucher), 0);
+}
+
+function getVoucherAmount(voucher) {
+  return Number(voucher?.[TYPES.voucher.fields.amount] ?? voucher?.opportunity ?? 0);
+}
+
+function getVoucherCurrency(voucher) {
+  return voucher?.currencyId || 'AMD';
+}
+
+function getVoucherAmountFields(voucher) {
+  return {
+    opportunity: getVoucherAmount(voucher),
+    currencyId: getVoucherCurrency(voucher)
+  };
+}
+
+function syncVoucherAmountFields(receiptId, receipt) {
+  return callBitrixMethod('crm.item.update', {
+    entityTypeId: TYPES.voucher.entityTypeId,
+    id: receiptId,
+    fields: getVoucherAmountFields(receipt)
+  });
 }
 
 export function planScheduleUpdates(schedules, amdTotal, stages) {
@@ -1010,19 +1244,6 @@ export function normalize(value) {
     .trim();
 }
 
-function uniqueSchedules(schedules) {
-  const seen = new Set();
-
-  return schedules.filter((schedule) => {
-    if (seen.has(schedule.id)) {
-      return false;
-    }
-
-    seen.add(schedule.id);
-    return true;
-  });
-}
-
 function isPayableSchedule(schedule, stages) {
   if (schedule.status === stages.schedule.paid) {
     return false;
@@ -1035,44 +1256,24 @@ function isPayableSchedule(schedule, stages) {
   );
 }
 
-function purposeMatchesSchedule(receipt, schedule, purposeNeedle = normalize(receipt.purpose)) {
-  const haystack = getScheduleSearchableText(schedule);
-  const dealTitle = normalize(schedule.deal?.title);
+export function dealMatchesReceipt(receipt, deal) {
+  const parsed = receipt.parsed ?? {};
 
-  if (purposeNeedle.length >= 3 && (includesText(haystack, purposeNeedle) || includesText(purposeNeedle, dealTitle))) {
-    return true;
+  if (hasApartmentConflict(parsed.apartment, deal)) {
+    return false;
   }
 
-  const parsed = receipt.parsed ?? {};
-  const numberTokens = getNumberTokens(haystack);
-  const buildingMatches = parsed.building ? numberTokens.has(normalizeNumber(parsed.building)) : false;
-  const apartmentMatches = parsed.apartment ? numberTokens.has(normalizeNumber(parsed.apartment)) : false;
-  const preliminaryMatches = parsed.preliminaryNumber ? numberTokens.has(normalizeNumber(parsed.preliminaryNumber)) : false;
-  const areaMatches = parsed.area ? numberTokens.has(normalizeNumber(parsed.area)) : false;
-  const projectMatches = parsed.project ? includesText(haystack, parsed.project) : false;
-  const contractMatches = parsed.contractDate ? includesText(haystack, parsed.contractDate) : false;
+  if (env.SMART_MATCH_V2) {
+    const smartEvidence = getSmartDealEvidence(receipt, deal);
 
-  return (
-    (buildingMatches && apartmentMatches) ||
-    (buildingMatches && preliminaryMatches) ||
-    (projectMatches && (apartmentMatches || preliminaryMatches || areaMatches || contractMatches))
-  );
-}
+    if (smartEvidence.conflict) return false;
+    if (smartEvidence.matched) return true;
+  }
 
-function amountMatches(schedule, receiptAmount) {
-  const amount = Number(receiptAmount ?? 0);
-  const scheduleAmount = Number(schedule.amount ?? 0);
-  const remaining = Number(schedule.remaining ?? scheduleAmount);
-
-  return scheduleAmount === amount || remaining === amount;
-}
-
-function dealMatchesReceipt(receipt, deal) {
-  const parsed = receipt.parsed ?? {};
   const haystack = deal.searchableText;
   const numberTokens = getNumberTokens(haystack);
   const buildingMatches = parsed.building ? numberTokens.has(normalizeNumber(parsed.building)) : false;
-  const apartmentMatches = parsed.apartment ? numberTokens.has(normalizeNumber(parsed.apartment)) : false;
+  const apartmentMatches = apartmentMatchesDeal(parsed.apartment, deal);
   const preliminaryMatches = parsed.preliminaryNumber ? numberTokens.has(normalizeNumber(parsed.preliminaryNumber)) : false;
   const areaMatches = parsed.area ? numberTokens.has(normalizeNumber(parsed.area)) : false;
   const projectMatches = parsed.project ? includesText(haystack, parsed.project) : false;
@@ -1101,7 +1302,7 @@ function getDirectDealScore(receipt, deal) {
     score += 8;
   }
 
-  if (parsed.apartment && numberTokens.has(normalizeNumber(parsed.apartment))) {
+  if (apartmentMatchesDeal(parsed.apartment, deal)) {
     score += 8;
   }
 
@@ -1113,29 +1314,95 @@ function getDirectDealScore(receipt, deal) {
     score += 6;
   }
 
+  if (env.SMART_MATCH_V2) {
+    score += getSmartDealEvidence(receipt, deal).score;
+  }
+
   return score;
 }
 
+function apartmentMatchesDeal(parsedApartment, deal) {
+  return Boolean(
+    parsedApartment &&
+    deal?.apartmentNumber &&
+    canonicalizeNumeric(parsedApartment) === canonicalizeNumeric(deal.apartmentNumber)
+  );
+}
+
+function hasApartmentConflict(parsedApartment, deal) {
+  return Boolean(
+    parsedApartment &&
+    deal?.apartmentNumber &&
+    canonicalizeNumeric(parsedApartment) !== canonicalizeNumeric(deal.apartmentNumber)
+  );
+}
+
+export function getSmartDealEvidence(receipt, deal) {
+  const purpose = receipt.purpose ?? '';
+  const projectLabel = BUILDING_OPTIONS.find((option) => option.value === deal.projectId)?.label ?? '';
+  const find = (target, kind, minConfidence = 0) => target
+    ? smartFindValue(purpose, target, {
+      kind,
+      allowFuzzy: kind === 'project',
+      minConfidence,
+      requireSemanticAnchor: true
+    })
+    : null;
+  const project = find(projectLabel, 'project', 0.7);
+  const apartment = find(deal.apartmentNumber, 'apartment', 0.8);
+  const floor = find(deal.floor, 'floor', 0.8);
+  const area = find(deal.area, 'area', 0.8);
+  const title = deal.title
+    ? smartFindValue(purpose, deal.title, { kind: 'label', allowFuzzy: false, minConfidence: 0.95 })
+    : null;
+  const name = receipt.payerName && deal.buyerName
+    ? namesOverlap(receipt.payerName, deal.buyerName)
+    : false;
+  const parsedApartment = receipt.parsed?.apartment;
+  const parsedProject = receipt.parsed?.project;
+  const apartmentConflict = Boolean(
+    parsedApartment &&
+    deal.apartmentNumber &&
+    canonicalizeNumeric(parsedApartment) !== canonicalizeNumeric(deal.apartmentNumber)
+  );
+  const projectConflict = Boolean(
+    parsedProject &&
+    projectLabel &&
+    canonicalize(parsedProject) !== canonicalize(projectLabel)
+  );
+  const conflict = apartmentConflict || projectConflict;
+
+  const matched = Boolean(
+    !conflict && (
+      title ||
+      (project && apartment) ||
+      (apartment && name) ||
+      (apartment && (floor || area)) ||
+      (project && name && (floor || area))
+    )
+  );
+  const score = conflict
+    ? 0
+    : (title ? 12 : 0) + (project ? 8 : 0) + (apartment ? 10 : 0) +
+      (floor ? 3 : 0) + (area ? 3 : 0) + (name ? 5 : 0);
+
+  return { matched, conflict, score };
+}
+
 function namesOverlap(left, right) {
+  if (env.SMART_MATCH_V2) {
+    const options = { kind: 'name', minConfidence: 0.7 };
+    const smartMatch = smartFindValue(right, left, options) ?? smartFindValue(left, right, options);
+
+    return Boolean(smartMatch);
+  }
+
   const leftWords = normalize(left)
     .split(' ')
     .filter((word) => word.length >= 3);
   const rightText = normalize(right);
 
   return leftWords.some((word) => rightText.includes(word));
-}
-
-function getScheduleSearchableText(schedule) {
-  return normalize(
-    [
-      schedule.title,
-      schedule.buyerName,
-      schedule.deal?.title,
-      schedule.deal?.buyerName,
-      schedule.deal?.address,
-      schedule.deal?.searchableText
-    ].join(' ')
-  );
 }
 
 function getNumberTokens(value) {
@@ -1177,55 +1444,4 @@ function transliterateLatinToArmenian(value) {
   };
 
   return dictionary[normalizedValue] ?? value;
-}
-
-function getSuggestionScore(receipt, schedule) {
-  const purposeNeedle = normalize(receipt.purpose);
-  const dealTitle = normalize(schedule.deal?.title);
-  const haystack = getScheduleSearchableText(schedule);
-
-  if (purposeNeedle && dealTitle && (purposeNeedle.includes(dealTitle) || dealTitle.includes(purposeNeedle))) {
-    return amountMatches(schedule, receipt.amount) ? 100 : 90;
-  }
-
-  if (purposeMatchesSchedule(receipt, schedule, purposeNeedle)) {
-    return amountMatches(schedule, receipt.amount) ? 98 : 88;
-  }
-
-  if (namesOverlap(receipt.payerName, schedule.buyerName) && amountMatches(schedule, receipt.amount)) {
-    return 92;
-  }
-
-  if (amountMatches(schedule, receipt.amount)) {
-    return 85;
-  }
-
-  return haystack ? 70 : 50;
-}
-
-function getSuggestionLabel(receipt, schedule) {
-  const purposeNeedle = normalize(receipt.purpose);
-  const dealTitle = normalize(schedule.deal?.title);
-
-  if (purposeNeedle && dealTitle && (purposeNeedle.includes(dealTitle) || dealTitle.includes(purposeNeedle))) {
-    return 'Purpose Match';
-  }
-
-  if (purposeMatchesSchedule(receipt, schedule, purposeNeedle)) {
-    return 'Details Match';
-  }
-
-  if (amountMatches(schedule, receipt.amount)) {
-    return 'Amount Match';
-  }
-
-  return 'Name Match';
-}
-
-function formatDate(value) {
-  if (!value) {
-    return '';
-  }
-
-  return new Date(value).toLocaleDateString('hy-AM');
 }

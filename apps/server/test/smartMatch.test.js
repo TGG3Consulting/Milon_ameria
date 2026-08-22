@@ -30,6 +30,18 @@ test('L1 normalized handles case, width, dashes and zero-width characters', () =
   }
 });
 
+test('L1 normalized composes combining sequences and unifies slash punctuation', () => {
+  const composed = smartFindValue('Cafe\u0301 Tower', 'Caf\u00e9 Tower', { kind: 'label' });
+  const composedWord = smartFindValue('Cafe\u0301 next', 'Caf\u00e9', { kind: 'label' });
+  const slash = smartFindValue('address 5\u20441', '5/1', { kind: 'address' });
+
+  assert.equal(composed.level, 'normalized');
+  assert.equal(composed.value, 'caf\u00e9 tower');
+  assert.equal('Cafe\u0301 Tower'.slice(composed.index, composed.index + composed.length), 'Cafe\u0301 Tower');
+  assert.equal('Cafe\u0301 next'.slice(composedWord.index, composedWord.index + composedWord.length), 'Cafe\u0301');
+  assert.equal(slash.level, 'normalized');
+});
+
 test('L2 regex resolves a value only the V2 anchors can find', () => {
   const result = smartFindValue('վճարում շենք 5, բն 1', '5/1', { kind: 'address' });
 
@@ -45,9 +57,19 @@ test('L3 fuzzy tolerates a typo in a project name', () => {
   assert.ok(result.confidence <= LEVEL_CONFIDENCE.fuzzy_max);
 });
 
+test('name token matching recognises reordered full names without making labels order-insensitive', () => {
+  const name = smartFindValue('Sargsyan Armen', 'Armen Sargsyan', { kind: 'name' });
+
+  assert.equal(name.level, 'token');
+  assert.equal(name.confidence, LEVEL_CONFIDENCE.token_exact);
+  assert.equal(smartFindValue('Tower Milon', 'Milon Tower', { kind: 'label', allowFuzzy: false }), null);
+});
+
 test('confidence is monotonic: fuzzy can never outrank regex, regex never outranks exact', () => {
   assert.ok(LEVEL_CONFIDENCE.fuzzy_max < LEVEL_CONFIDENCE.regex_composed);
   assert.ok(LEVEL_CONFIDENCE.regex_keyword < LEVEL_CONFIDENCE.normalized);
+  assert.ok(LEVEL_CONFIDENCE.regex_keyword < LEVEL_CONFIDENCE.token_exact);
+  assert.ok(LEVEL_CONFIDENCE.token_exact < LEVEL_CONFIDENCE.normalized);
   assert.ok(LEVEL_CONFIDENCE.normalized < LEVEL_CONFIDENCE.exact);
 });
 
@@ -67,6 +89,14 @@ test('INVARIANT: a valid numeric match still works', () => {
 
   assert.ok(result);
   assert.equal(result.value, '12');
+});
+
+test('semantic numeric fields can require their own anchor', () => {
+  const anchored = { kind: 'apartment', requireSemanticAnchor: true };
+
+  assert.equal(smartFindValue('payment reference 55', '55', anchored), null);
+  assert.equal(smartFindValue('payment apartment 55', '55', anchored).level, 'regex');
+  assert.equal(smartFindValue('payment building 55', '55', anchored), null);
 });
 
 test('INVARIANT: a number inside a date is never returned', () => {
@@ -184,6 +214,16 @@ test('smartFindBest refuses to choose between equally confident different values
   assert.equal(smartFindBest('apt 5', [], NUMBER), null);
 });
 
+test('smartFindBest compares target identities, not only the substring they happened to match', () => {
+  assert.equal(
+    smartFindBest('Milon Towerr', ['Milon Tower', 'Milon Towers'], { kind: 'label' }),
+    null
+  );
+
+  // Numeric aliases that canonicalise to the same identifier are not a real ambiguity.
+  assert.equal(smartFindBest('apt 005', ['5', '05'], NUMBER).value, '005');
+});
+
 test('canonicalisation helpers behave as documented', () => {
   assert.equal(canonicalize('  APT  55  '), 'apt 55');
   assert.equal(canonicalize('bn​48'), 'bn48');
@@ -191,6 +231,8 @@ test('canonicalisation helpers behave as documented', () => {
   assert.equal(canonicalizeNumeric('05/01'), '5/1');
   assert.equal(canonicalizeNumeric('55,7'), '55.7');
   assert.equal(canonicalizeNumeric('100'), '100');
+  assert.equal(canonicalize('Cafe\u0301'), 'caf\u00e9');
+  assert.equal(canonicalize('5\u20441'), '5/1');
 });
 
 test('evidence is returned and points at the match', () => {

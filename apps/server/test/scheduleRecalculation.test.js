@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getDefaultStages, planScheduleUpdates, sumAmdVouchers } from '../src/services/matchEngine.js';
+import {
+  assertDealScheduleSummaryPersisted,
+  dealMatchesReceipt,
+  getDealScheduleSummaryFields,
+  getDefaultStages,
+  parsePurpose,
+  planScheduleUpdates,
+  sumAmdVouchers
+} from '../src/services/matchEngine.js';
 
 const stages = getDefaultStages();
 
@@ -18,6 +26,56 @@ test('counts only AMD receipts in the deal total', () => {
   ]);
 
   assert.equal(total, 300000);
+});
+
+test('uses the voucher custom amount before stale opportunity', () => {
+  const total = sumAmdVouchers([
+    { id: '1', opportunity: 1000000, ufCrm19_1785737375: 20000000, ufCrm19_1785737270: 1651, currencyId: 'AMD' }
+  ]);
+
+  assert.equal(total, 20000000);
+});
+
+test('writes deal totals only to the confirmed production fields', () => {
+  const fields = getDealScheduleSummaryFields(
+    [makeSchedule(839, 10400000), makeSchedule(841, 10400000), makeSchedule(843, 10400000), makeSchedule(845, 10400000)],
+    20760000
+  );
+
+  assert.deepEqual(fields, {
+    UF_CRM_1785062378: ['839', '841', '843', '845'],
+    UF_CRM_1776322253480: '20840000|AMD',
+    UF_CRM_1776609678581: '20760000|AMD'
+  });
+  assert.equal('UF_CRM_1785062920' in fields, false);
+  assert.equal('UF_CRM_1785062958' in fields, false);
+});
+
+test('detects when Bitrix automation overwrites a saved deal total', () => {
+  const expected = {
+    UF_CRM_1776322253480: '20840000|AMD',
+    UF_CRM_1776609678581: '20760000|AMD'
+  };
+
+  assert.doesNotThrow(() => assertDealScheduleSummaryPersisted(expected, expected));
+  assert.throws(
+    () => assertDealScheduleSummaryPersisted({ ...expected, UF_CRM_1776609678581: null }, expected),
+    (error) => error.status === 409 && error.code === 'BITRIX_AUTOMATION_CONFLICT'
+  );
+});
+
+test('does not suggest a deal with a different explicit apartment number', () => {
+  const receipt = {
+    parsed: parsePurpose('test payment բն.502 for Deal 6655'),
+    payerName: 'Միրզախանյան Միրզախան test'
+  };
+  const wrongApartmentDeal = {
+    apartmentNumber: '501',
+    buyerName: 'Միրզախանյան Միրզախան test',
+    searchableText: 'Միրզախանյան Միրզախան test բնակարան 501 linked receipt mentions 502'
+  };
+
+  assert.equal(dealMatchesReceipt(receipt, wrongApartmentDeal), false);
 });
 
 test('pays schedules in id order and marks the partially covered one', () => {
@@ -60,6 +118,15 @@ test('closes a partially paid schedule once the remainder is covered', () => {
   assert.equal(updates[0].fields.stageId, stages.schedule.paid);
   assert.equal(updates[0].fields.ufCrm17_1785747159082, '');
   assert.equal(updates[0].fields.ufCrm17_1785747288489, '');
+});
+
+test('keeps a partially paid schedule partial when only part of the remainder is covered', () => {
+  const partial = { ...makeSchedule(1, 100000, stages.schedule.partial), remaining: 40000, partialPaid: 60000 };
+  const updates = planScheduleUpdates([partial], 70000, stages);
+
+  assert.equal(updates[0].fields.stageId, stages.schedule.partial);
+  assert.equal(updates[0].fields.ufCrm17_1785747159082, 70000);
+  assert.equal(updates[0].fields.ufCrm17_1785747288489, 30000);
 });
 
 test('produces no updates when nothing is paid yet', () => {

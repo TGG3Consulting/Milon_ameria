@@ -5,9 +5,10 @@
 // "5/1" and a purpose saying "շենք 5, բն 1" never matches. Here the clean CRM value is the needle
 // and the dirty purpose is the haystack.
 //
-// Four levels, strictly ordered, short-circuiting on the first hit:
+// Five levels, strictly ordered, short-circuiting on the first hit:
 //   L0 exact       1.00  raw text, raw case
 //   L1 normalized  0.95  own canonicalisation (leading zeros, dashes, width, spacing)
+//   L1b name token 0.925 exact full-name tokens in another order
 //   L2 regex       0.80-0.90  PURPOSE_PATTERNS_V2
 //   L3 fuzzy      <=0.75  text values only, never numbers
 //
@@ -22,6 +23,7 @@ import { PURPOSE_PATTERNS_V2, findAmbiguousDateAddressSpans, maskDates } from '.
 export const LEVEL_CONFIDENCE = Object.freeze({
   exact: 1.0,
   normalized: 0.95,
+  token_exact: 0.925,
   regex_keyword: 0.9,
   regex_reverse: 0.85,
   regex_composed: 0.8,
@@ -52,9 +54,12 @@ const KIND_TO_V2_FIELD = Object.freeze({
 const MIN_FUZZY_TARGET_LENGTH = 5;
 const MAX_FUZZY_HAYSTACK_LENGTH = 4000;
 const MAX_FUZZY_WINDOW_SLACK = 1;
+const DEFAULT_BEST_AMBIGUITY_MARGIN = 0.02;
 
 const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/u;
 const DASH_LIKE = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/u;
+const SLASH_LIKE = /[\u2044\u2215\u29F8\uFF0F]/u;
+const APOSTROPHE_LIKE = /[\u2018\u2019\u02BC\uFF07]/u;
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
@@ -69,45 +74,66 @@ function escapeRegExp(value) {
 export function canonicalizeWithMap(input) {
   const source = String(input ?? '');
   const map = [];
+  const endMap = [];
   let text = '';
   let pendingSpace = false;
   let index = 0;
 
   while (index < source.length) {
+    const clusterStart = index;
     const codePoint = source.codePointAt(index);
-    const character = String.fromCodePoint(codePoint);
-    const size = character.length;
+    let character = String.fromCodePoint(codePoint);
+    let size = character.length;
+
+    // Normalising one code point at a time does not compose decomposed input such as
+    // `e + COMBINING ACUTE`. Keep the starter and all following marks in one cluster.
+    let nextIndex = index + size;
+    while (nextIndex < source.length) {
+      const nextCodePoint = source.codePointAt(nextIndex);
+      const nextCharacter = String.fromCodePoint(nextCodePoint);
+
+      if (!/\p{M}/u.test(nextCharacter)) break;
+      character += nextCharacter;
+      size += nextCharacter.length;
+      nextIndex += nextCharacter.length;
+    }
 
     if (ZERO_WIDTH.test(character)) {
-      index += size;
+      index = nextIndex;
       continue;
     }
 
     if (/\s/u.test(character)) {
       pendingSpace = true;
-      index += size;
+      index = nextIndex;
       continue;
     }
 
     if (pendingSpace && text.length) {
       text += ' ';
       map.push(index);
+      endMap.push(index);
     }
     pendingSpace = false;
 
     const replacement = DASH_LIKE.test(character)
       ? '-'
-      : character.normalize('NFKC').toLocaleLowerCase('hy-AM');
+      : SLASH_LIKE.test(character)
+        ? '/'
+        : APOSTROPHE_LIKE.test(character)
+          ? "'"
+          : character.normalize('NFKC').toLocaleLowerCase('hy-AM');
 
     for (const piece of replacement) {
       text += piece;
-      map.push(index);
+      map.push(clusterStart);
+      endMap.push(nextIndex);
     }
 
-    index += size;
+    index = nextIndex;
   }
 
-  return { text, map, source };
+  return { text, map, endMap, source };
 }
 
 export function canonicalize(input) {
@@ -121,15 +147,13 @@ export function canonicalizeNumeric(input) {
     .replace(/(?<![\d.])0+(?=\d)/gu, '');
 }
 
-function sourceSpan({ map, source }, start, length) {
+function sourceSpan({ map, endMap, source }, start, length) {
   if (!length) return null;
 
   const startIndex = map[start];
-  const lastIndex = map[start + length - 1];
-  const lastCodePoint = source.codePointAt(lastIndex);
-  const lastSize = String.fromCodePoint(lastCodePoint).length;
+  const endIndex = endMap?.[start + length - 1] ?? source.length;
 
-  return { index: startIndex, length: lastIndex + lastSize - startIndex };
+  return { index: startIndex, length: endIndex - startIndex };
 }
 
 function evidenceAround(text, start, length, radius = 12) {
@@ -335,8 +359,38 @@ function tokenizeWithOffsets(text) {
   return tokens;
 }
 
-function levelFuzzy(context, target, minConfidence) {
-  const needle = foldForOcr(canonicalize(target));
+function canonicalTokens(value) {
+  return canonicalize(value).match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function levelTokenExact(context, target, kind) {
+  if (kind !== 'name') return null;
+
+  const targetTokens = canonicalTokens(target);
+  if (targetTokens.length < 2) return null;
+
+  const wanted = [...targetTokens].sort().join('\u0000');
+  const tokens = tokenizeWithOffsets(context.text);
+
+  for (let start = 0; start + targetTokens.length <= tokens.length; start += 1) {
+    const window = tokens.slice(start, start + targetTokens.length);
+    const found = window.map((token) => token.text).sort().join('\u0000');
+
+    if (found !== wanted) continue;
+
+    return {
+      start: window[0].start,
+      length: window[window.length - 1].end - window[0].start,
+      matched: context.text.slice(window[0].start, window[window.length - 1].end)
+    };
+  }
+
+  return null;
+}
+
+function levelFuzzy(context, target, kind, minConfidence) {
+  const targetTokens = canonicalTokens(target);
+  const needle = foldForOcr(kind === 'name' ? [...targetTokens].sort().join(' ') : canonicalize(target));
 
   if (needle.length < MIN_FUZZY_TARGET_LENGTH) return null;
   if (context.text.length > MAX_FUZZY_HAYSTACK_LENGTH) return null;
@@ -350,7 +404,10 @@ function levelFuzzy(context, target, minConfidence) {
     for (let start = 0; start + size <= tokens.length; start += 1) {
       const window = tokens.slice(start, start + size);
       const text = window.map((token) => token.text).join(' ');
-      const distance = boundedDistance(needle, foldForOcr(text), budget);
+      const comparable = kind === 'name'
+        ? [...window.map((token) => token.text)].sort().join(' ')
+        : text;
+      const distance = boundedDistance(needle, foldForOcr(comparable), budget);
 
       if (distance > budget) continue;
 
@@ -392,17 +449,22 @@ function levelFuzzy(context, target, minConfidence) {
 /**
  * @param {string} haystack free-form text, typically the payment purpose
  * @param {string} target    structured value, typically taken from Bitrix
- * @param {{kind?: string, allowFuzzy?: boolean, minConfidence?: number}} [options]
+ * @param {{kind?: string, allowFuzzy?: boolean, minConfidence?: number,
+ *          requireSemanticAnchor?: boolean}} [options]
  * @returns {{value: string, index: number, length: number, level: string,
  *            confidence: number, evidence: string}|null}
  */
 export function smartFindValue(haystack, target, options = {}) {
-  const { kind = 'label', allowFuzzy = true, minConfidence = 0 } = options;
+  const {
+    kind = 'label',
+    allowFuzzy = true,
+    minConfidence = 0,
+    requireSemanticAnchor = false
+  } = options;
   const rawTarget = String(target ?? '').trim();
   const rawHaystack = String(haystack ?? '');
 
   if (!rawTarget || !rawHaystack) return null;
-  if (rawTarget.length > rawHaystack.length) return null;
 
   const numeric = NUMERIC_KINDS.has(kind);
   // Dates are masked for L0 as well. Masking substitutes spaces of equal length, so raw offsets
@@ -428,6 +490,7 @@ export function smartFindValue(haystack, target, options = {}) {
   }
 
   const variants = kind === 'address' ? addressVariants(rawTarget) : [rawTarget];
+  const literalLevelsAllowed = !requireSemanticAnchor || !numeric || !KIND_TO_V2_FIELD[kind];
 
   const finish = (context, hit, level, confidence) => {
     const span = context.map
@@ -447,18 +510,28 @@ export function smartFindValue(haystack, target, options = {}) {
   };
 
   // L0 - exact, raw text and raw case.
-  for (const variant of variants) {
-    const hit = levelExact(rawContext, variant, numeric, null);
+  if (literalLevelsAllowed) {
+    for (const variant of variants) {
+      const hit = levelExact(rawContext, variant, numeric, null);
 
-    if (hit) return finish(rawContext, hit, 'exact', LEVEL_CONFIDENCE.exact);
+      if (hit) return finish(rawContext, hit, 'exact', LEVEL_CONFIDENCE.exact);
+    }
   }
 
   // L1 - normalized exact.
-  for (const variant of variants) {
-    const hit = levelNormalized(searchContext, variant, numeric, null);
+  if (literalLevelsAllowed) {
+    for (const variant of variants) {
+      const hit = levelNormalized(searchContext, variant, numeric, null);
 
-    if (hit) return finish(searchContext, hit, 'normalized', LEVEL_CONFIDENCE.normalized);
+      if (hit) return finish(searchContext, hit, 'normalized', LEVEL_CONFIDENCE.normalized);
+    }
   }
+
+  // Exact name tokens in another order are strong evidence, but weaker than an in-order literal.
+  // This is intentionally name-only: word order can carry meaning in arbitrary labels.
+  const tokenHit = levelTokenExact(canonicalContext, rawTarget, kind);
+
+  if (tokenHit) return finish(canonicalContext, tokenHit, 'token', LEVEL_CONFIDENCE.token_exact);
 
   // L2 - regex, anchored by V2 keyword patterns.
   const regexHit = levelRegex(searchContext, rawTarget, kind, numeric)
@@ -469,14 +542,14 @@ export function smartFindValue(haystack, target, options = {}) {
   // L3 - fuzzy, text values only.
   if (!allowFuzzy || numeric || !FUZZY_KINDS.has(kind)) return null;
 
-  const fuzzyHit = levelFuzzy(canonicalContext, rawTarget, minConfidence);
+  const fuzzyHit = levelFuzzy(canonicalContext, rawTarget, kind, minConfidence);
 
   return fuzzyHit ? finish(canonicalContext, fuzzyHit, 'fuzzy', fuzzyHit.confidence) : null;
 }
 
 /**
  * Runs smartFindValue for several candidate targets and returns the single best result.
- * Returns null when the two best results are equally confident but point at different values.
+ * Returns null when distinct candidate identities fall inside the configured confidence margin.
  */
 export function smartFindBest(haystack, targets, options = {}) {
   const list = (Array.isArray(targets) ? targets : [targets]).filter(
@@ -495,8 +568,17 @@ export function smartFindBest(haystack, targets, options = {}) {
   results.sort((left, right) => right.confidence - left.confidence || left.index - right.index);
 
   const [best, second] = results;
+  const numeric = NUMERIC_KINDS.has(options.kind);
+  const targetKey = (value) => numeric ? canonicalizeNumeric(value) : canonicalize(value);
+  const ambiguityMargin = Number.isFinite(options.ambiguityMargin)
+    ? Math.max(0, Number(options.ambiguityMargin))
+    : DEFAULT_BEST_AMBIGUITY_MARGIN;
 
-  if (second && second.confidence === best.confidence && second.value !== best.value) return null;
+  if (
+    second &&
+    targetKey(second.target) !== targetKey(best.target) &&
+    best.confidence - second.confidence <= ambiguityMargin
+  ) return null;
 
   return best;
 }

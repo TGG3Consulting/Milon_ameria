@@ -35,6 +35,7 @@ const envSchema = z.object({
   AMERIA_SYNC_RUN_ON_START: optionalBoolean.default(false),
   AMERIA_SYNC_INTERVAL_MS: z.coerce.number().int().min(60000).default(300000),
   ACTIVITY_LOG_PATH: optionalString,
+  BITRIX_REFRESH_STAGE_IDS: optionalBoolean.default(false),
   // Additive matching layer (smartMatch.js + parsePurposeV2). Off by default: while it is false
   // the legacy parser and the legacy suggestion order stay byte-for-byte unchanged.
   SMART_MATCH_V2: optionalBoolean.default(false)

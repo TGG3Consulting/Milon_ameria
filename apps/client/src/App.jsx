@@ -8,7 +8,8 @@ import {
   Filter,
   Link2,
   RefreshCw,
-  Search
+  Search,
+  X
 } from 'lucide-react';
 import {
   confirmMatch,
@@ -39,6 +40,11 @@ export default function App() {
   const [selectedSuggestionId, setSelectedSuggestionId] = useState('');
   const [suggestionModalClosed, setSuggestionModalClosed] = useState(false);
   const [suggestionAccepting, setSuggestionAccepting] = useState(false);
+  const [viewedDeal, setViewedDeal] = useState(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [confirmingReceiptIds, setConfirmingReceiptIds] = useState([]);
+  const [pendingMatches, setPendingMatches] = useState([]);
+  const [processingMatches, setProcessingMatches] = useState([]);
   const [openFilterKey, setOpenFilterKey] = useState('');
   const [columnFilters, setColumnFilters] = useState({
     unmatched: createEmptyColumnFilter(),
@@ -62,6 +68,15 @@ export default function App() {
     activeReceipt?.suggestions.find((suggestion) => getSuggestionId(suggestion) === selectedSuggestionId) ??
     activeReceipt?.suggestions[0] ??
     null;
+
+  function isMatchQueued(receiptId) {
+    const normalizedId = String(receiptId ?? '');
+    return Boolean(
+      normalizedId &&
+        (pendingMatches.some((match) => match.receiptId === normalizedId) ||
+          processingMatches.some((match) => match.receiptId === normalizedId))
+    );
+  }
 
   async function refreshData() {
     setLoading(true);
@@ -93,21 +108,82 @@ export default function App() {
     setSelectedDeal(null);
   }
 
-  async function handleConfirm({ receiptId = selectedReceipt?.id, dealId, scheduleIds }) {
+  async function executeConfirm({ receiptId, dealId, scheduleIds, jobKey, controller }) {
     setError('');
+
+    if (!receiptId || confirmingReceiptIds.includes(String(receiptId))) {
+      return false;
+    }
+
+    setConfirmingReceiptIds((current) => [...current, String(receiptId)]);
 
     try {
       await confirmMatch({
         receiptId,
         dealId,
         scheduleIds
+      }, {
+        signal: controller?.signal
       });
       setSelectedDeal(null);
       setManualDeals([]);
       await refreshData();
+      return true;
     } catch (err) {
-      setError(err.message);
+      if (err.name !== 'AbortError') {
+        setError(err.message);
+      }
+      return false;
+    } finally {
+      setConfirmingReceiptIds((current) => current.filter((id) => id !== String(receiptId)));
+      if (jobKey) {
+        setProcessingMatches((current) => current.filter((match) => match.jobKey !== jobKey));
+      }
     }
+  }
+
+  function handleConfirm({ receiptId = selectedReceipt?.id, dealId, scheduleIds }) {
+    const nextReceiptId = receiptId ? String(receiptId) : '';
+
+    setError('');
+
+    const isAlreadyQueued =
+      pendingMatches.some((match) => match.receiptId === nextReceiptId) ||
+      processingMatches.some((match) => match.receiptId === nextReceiptId);
+
+    if (!nextReceiptId || confirmingReceiptIds.includes(nextReceiptId) || isAlreadyQueued) {
+      return false;
+    }
+
+    setPendingMatches((current) => [...current, {
+      jobKey: `${nextReceiptId}-${Date.now()}`,
+      receiptId: nextReceiptId,
+      dealId,
+      scheduleIds: scheduleIds ?? [],
+      seconds: 30
+    }]);
+
+    return true;
+  }
+
+  function cancelPendingMatch(jobKey) {
+    setPendingMatches((current) => current.filter((match) => match.jobKey !== jobKey));
+  }
+
+  function cancelProcessingMatch(jobKey) {
+    setProcessingMatches((current) => {
+      const match = current.find((item) => item.jobKey === jobKey);
+      match?.controller?.abort();
+      return current.filter((item) => item.jobKey !== jobKey);
+    });
+  }
+
+  function cancelAllMatches() {
+    setPendingMatches([]);
+    setProcessingMatches((current) => {
+      current.forEach((match) => match.controller?.abort());
+      return [];
+    });
   }
 
   async function handleAcceptSuggestion() {
@@ -118,13 +194,16 @@ export default function App() {
     setSuggestionAccepting(true);
 
     try {
-      await handleConfirm({
+      const confirmed = await handleConfirm({
         receiptId: activeReceipt.id,
         dealId: selectedModalSuggestion.deal.id,
         scheduleIds: selectedModalSuggestion.scheduleIds
       });
-      setReceiptQueueIndex(0);
-      setSelectedSuggestionId('');
+      if (confirmed) {
+        setReceiptQueueIndex(0);
+        setSelectedSuggestionId('');
+        setSuggestionModalClosed(true);
+      }
     } finally {
       setSuggestionAccepting(false);
     }
@@ -145,6 +224,39 @@ export default function App() {
   useEffect(() => {
     refreshData();
   }, []);
+
+  useEffect(() => {
+    if (!pendingMatches.length) return undefined;
+
+    const interval = window.setInterval(() => {
+      setPendingMatches((current) => {
+        const ready = [];
+        const waiting = [];
+
+        for (const match of current) {
+          const nextMatch = { ...match, seconds: Math.max(match.seconds - 1, 0) };
+          if (nextMatch.seconds <= 0) {
+            ready.push(nextMatch);
+          } else {
+            waiting.push(nextMatch);
+          }
+        }
+
+        for (const match of ready) {
+          const controller = new AbortController();
+          const processingMatch = { ...match, controller };
+          setProcessingMatches((processing) => [...processing, processingMatch]);
+          executeConfirm(processingMatch);
+        }
+
+        return waiting;
+      });
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [pendingMatches.length]);
 
   useEffect(() => {
     if (!manualSearchOpen) return undefined;
@@ -199,6 +311,10 @@ export default function App() {
             label="Bitrix24"
             value={health?.bitrix?.configured ? 'Webhook OK' : 'No webhook'}
           />
+          <button className="history-button" type="button" onClick={() => setHistoryOpen(true)}>
+            <Clock3 size={16} />
+            History
+          </button>
           <button className="icon-button" type="button" onClick={refreshData} aria-label="Refresh">
             <RefreshCw size={18} />
           </button>
@@ -240,13 +356,19 @@ export default function App() {
           <ReceiptSidebar
             receipt={selectedReceipt}
             loading={loading}
+            confirming={Boolean(
+              selectedReceipt?.id &&
+                (confirmingReceiptIds.includes(String(selectedReceipt.id)) ||
+                  isMatchQueued(selectedReceipt.id))
+            )}
+            onDealView={setViewedDeal}
             onConfirm={handleConfirm}
             onOpenManualSearch={() => setManualSearchOpen(true)}
           />
         </aside>
       </section>
 
-      <section className="activity">
+      {board.log.length < 0 ? <section className="activity">
         <div className="section-title">
           <Clock3 size={18} />
           <h2>Գործողությունների պատմություն</h2>
@@ -260,16 +382,20 @@ export default function App() {
             </div>
           ))}
         </div>
-      </section>
+      </section> : null}
 
       {activeReceipt ? (
         <SuggestionModal
           receipt={activeReceipt}
-          accepting={suggestionAccepting}
+          accepting={
+            suggestionAccepting ||
+            Boolean(activeReceipt?.id && isMatchQueued(activeReceipt.id))
+          }
           index={receiptQueueIndex}
           selectedSuggestionId={selectedSuggestionId || getSuggestionId(activeReceipt.suggestions[0])}
           total={receiptQueue.length}
           onAccept={handleAcceptSuggestion}
+          onDealView={setViewedDeal}
           onSelectSuggestion={setSelectedSuggestionId}
           onSkip={handleSkipReceiptSuggestions}
         />
@@ -279,6 +405,11 @@ export default function App() {
           deals={manualDeals}
           filters={manualFilters}
           loading={manualSearchLoading}
+          confirming={Boolean(
+            selectedReceipt?.id &&
+              (confirmingReceiptIds.includes(String(selectedReceipt.id)) ||
+                isMatchQueued(selectedReceipt.id))
+          )}
           selectedDeal={selectedDeal}
           onClose={() => setManualSearchOpen(false)}
           onConfirm={(payload) => {
@@ -288,6 +419,34 @@ export default function App() {
           onSearch={handleSearch}
           onSelectDeal={setSelectedDeal}
         />
+      ) : null}
+      {viewedDeal ? <DealDetailsModal deal={viewedDeal} onClose={() => setViewedDeal(null)} /> : null}
+      {historyOpen ? <HistoryModal log={board.log} onClose={() => setHistoryOpen(false)} /> : null}
+      {pendingMatches.length || processingMatches.length ? (
+        <div className="pending-match-stack">
+          {pendingMatches.length + processingMatches.length > 1 ? (
+            <button className="secondary cancel-all-matches-button" type="button" onClick={cancelAllMatches}>
+              <X size={16} />
+              Cancel all
+            </button>
+          ) : null}
+          {pendingMatches.map((match) => (
+            <PendingMatchModal
+              key={match.jobKey}
+              match={match}
+              seconds={match.seconds}
+              onCancel={() => cancelPendingMatch(match.jobKey)}
+            />
+          ))}
+          {processingMatches.map((match) => (
+            <PendingMatchModal
+              key={match.jobKey}
+              match={match}
+              seconds={null}
+              onCancel={() => cancelProcessingMatch(match.jobKey)}
+            />
+          ))}
+        </div>
       ) : null}
     </main>
   );
@@ -322,6 +481,7 @@ function SuggestionModal({
   selectedSuggestionId,
   total,
   onAccept,
+  onDealView,
   onSelectSuggestion,
   onSkip
 }) {
@@ -366,7 +526,16 @@ function SuggestionModal({
                 />
                 <span>
                   <div className="suggestion-head">
-                    <strong>{suggestion.deal.buyerName}</strong>
+                    <button
+                      className="deal-name-button"
+                      type="button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        onDealView(suggestion.deal);
+                      }}
+                    >
+                      {suggestion.deal.buyerName}
+                    </button>
                     <em>{suggestion.label}</em>
                   </div>
                   <p>{suggestion.deal.address}</p>
@@ -401,6 +570,69 @@ function StatusPill({ icon, label, value }) {
       {icon}
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function HistoryModal({ log, onClose }) {
+  return (
+    <div className="suggestion-modal-backdrop" role="presentation">
+      <section className="history-modal" role="dialog" aria-modal="true" aria-labelledby="history-title">
+        <div className="suggestion-modal-head">
+          <div>
+            <p className="eyebrow">History</p>
+            <h2 id="history-title">Գործողությունների պատմություն</h2>
+          </div>
+          <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="activity-list history-list">
+          {log.map((item) => (
+            <div className="activity-row" key={item.id}>
+              <span>{new Date(item.createdAt).toLocaleString('hy-AM')}</span>
+              <strong>{item.receiptId}</strong>
+              <p>{item.action}</p>
+            </div>
+          ))}
+          {!log.length ? <p className="muted">Պատմություն չկա</p> : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PendingMatchModal({ match, seconds, onCancel }) {
+  const isProcessing = seconds === null;
+
+  return (
+    <div className="suggestion-modal-backdrop pending-match-backdrop" role="presentation">
+      <section className={`pending-match-modal ${isProcessing ? 'is-processing' : ''}`} role="dialog" aria-modal="true" aria-labelledby="pending-match-title">
+        <div className="suggestion-modal-head">
+          <div>
+            <p className="eyebrow">Pending Match</p>
+            <h2 id="pending-match-title">{'\u0540\u0561\u0574\u0561\u057a\u0561\u057f\u0561\u057d\u056d\u0561\u0576\u0565\u0581\u0578\u0582\u0574\u0568 \u056f\u057d\u056f\u057d\u057e\u056b \u0577\u0578\u0582\u057f\u0578\u057e'}</h2>
+          </div>
+          <span>{isProcessing ? <RefreshCw size={18} /> : seconds}</span>
+        </div>
+        <div className="pending-countdown">
+          <strong className="processing-label">Հաշվարկվում է</strong>
+          <strong>{seconds} վրկ</strong>
+          <p>
+            {'\u053f\u057f\u0580\u0578\u0576 #'}
+            {match.receiptId}
+            {' \u056f\u0570\u0561\u0574\u0561\u057a\u0561\u057f\u0561\u057d\u056d\u0561\u0576\u0565\u0581\u057e\u056b Deal #'}
+            {match.dealId}
+            {' \u0563\u0578\u0580\u056e\u0561\u0580\u0584\u056b\u0576, \u0565\u0569\u0565 \u0579\u0579\u0565\u0572\u0561\u0580\u056f\u0565\u0584:'}
+          </p>
+        </div>
+        <div className="suggestion-modal-actions">
+          <button className="secondary cancel-pending-button" type="button" onClick={onCancel}>
+            <X size={16} />
+            Cancel
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -556,7 +788,7 @@ function getReceiptDate(receipt) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function ManualSearchModal({ deals, filters, loading, selectedDeal, onClose, onConfirm, onSearch, onSelectDeal }) {
+function ManualSearchModal({ deals, filters, loading, confirming, selectedDeal, onClose, onConfirm, onSearch, onSelectDeal }) {
   return (
     <div className="suggestion-modal-backdrop" role="presentation">
       <section className="manual-search-modal" role="dialog" aria-modal="true" aria-labelledby="manual-search-title">
@@ -617,7 +849,7 @@ function ManualSearchModal({ deals, filters, loading, selectedDeal, onClose, onC
           <button className="secondary" type="button" onClick={onClose}>
             Փակել
           </button>
-          <button disabled={!selectedDeal} type="button" onClick={() => onConfirm({ dealId: selectedDeal.id })}>
+          <button disabled={!selectedDeal || confirming} type="button" onClick={() => onConfirm({ dealId: selectedDeal.id })}>
             <Check size={16} />
             Կապել ձեռքով
           </button>
@@ -630,6 +862,8 @@ function ManualSearchModal({ deals, filters, loading, selectedDeal, onClose, onC
 function ReceiptSidebar({
   receipt,
   loading,
+  confirming,
+  onDealView,
   onConfirm,
   onOpenManualSearch
 }) {
@@ -667,9 +901,11 @@ function ReceiptSidebar({
         <div className="suggestion-list">
           {receipt.suggestions.map((suggestion) => (
             <article className="suggestion" key={getSuggestionId(suggestion)}>
-              <div>
+              <div className="suggestion-body-button">
                 <div className="suggestion-head">
-                  <strong>{suggestion.deal.buyerName}</strong>
+                  <button className="deal-name-button" type="button" onClick={() => onDealView(suggestion.deal)}>
+                    {suggestion.deal.buyerName}
+                  </button>
                   <span>{suggestion.label}</span>
                 </div>
                 <p>{suggestion.deal.address}</p>
@@ -679,10 +915,9 @@ function ReceiptSidebar({
                   {suggestion.deal.amount ? (
                     <span>{formatMoney(suggestion.deal.amount, suggestion.deal.currency)}</span>
                   ) : null}
-                  {suggestion.scheduleIds?.length ? <span>Schedule {suggestion.scheduleIds.join(', ')}</span> : null}
                 </div>
                 <small>{suggestion.reason}</small>
-                {suggestion.deal.schedules?.length ? (
+                {suggestion.deal.showSchedulesInCard && suggestion.deal.schedules?.length ? (
                   <div className="schedule-preview">
                     {suggestion.deal.schedules.map((schedule) => (
                       <span key={schedule.id}>
@@ -694,6 +929,7 @@ function ReceiptSidebar({
                 ) : null}
               </div>
               <button
+                disabled={confirming}
                 type="button"
                 onClick={() =>
                   onConfirm({
@@ -721,6 +957,113 @@ function ReceiptSidebar({
   );
 }
 
+function DealDetailsModal({ deal, onClose }) {
+  const fields = [
+    ['Deal ID', `#${deal.id}`],
+    ['Գործարք', deal.title || deal.address],
+    ['Հաճախորդ', deal.buyerName],
+    ['Contact ID', deal.contactId ? `#${deal.contactId}` : ''],
+    ['Գումար', deal.amount ? formatMoney(deal.amount, deal.currency) : ''],
+    ['Project', deal.projectName || deal.projectId],
+    ['Building section', deal.buildingSectionId],
+    ['Բնակարան', deal.apartmentNumber],
+    ['Հարկ', deal.floor],
+    ['Մակերես', deal.area],
+    ['Գրաֆիկ IDs', deal.scheduleIds?.join(', ')]
+  ].filter(([, value]) => value);
+
+  return (
+    <div className="suggestion-modal-backdrop" role="presentation">
+      <section className="deal-details-modal" role="dialog" aria-modal="true" aria-labelledby="deal-details-title">
+        <div className="suggestion-modal-head">
+          <div>
+            <p className="eyebrow">Deal Details</p>
+            <h2 id="deal-details-title">{deal.buyerName || deal.title || `Deal #${deal.id}`}</h2>
+          </div>
+          <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="deal-details-grid">
+          {fields.map(([label, value]) => (
+            <div className="deal-detail-field" key={label}>
+              <span>{label}</span>
+              <strong>{value}</strong>
+            </div>
+          ))}
+        </div>
+
+        <div className="deal-schedules-panel">
+          <div className="section-title">
+            <Banknote size={18} />
+            <h3>{'\u054e\u0573\u0561\u0580\u0578\u0582\u0574\u0576\u0565\u0580\u056b \u0562\u0561\u0577\u056d\u0578\u0582\u0574'}</h3>
+          </div>
+          {deal.paymentTimeline?.length ? (
+            <div className="payment-timeline">
+              {deal.paymentTimeline.map((payment) => (
+                <div className="payment-step" key={payment.receiptId}>
+                  <div className="payment-step-head">
+                    <strong>
+                      {'\u053f\u057f\u0580\u0578\u0576 #'}
+                      {payment.receiptId}
+                    </strong>
+                    <span>{formatMoney(payment.amount, payment.currency)}</span>
+                    {payment.paymentDate ? <small>{formatDate(payment.paymentDate)}</small> : null}
+                  </div>
+                  {payment.allocations.map((allocation) => (
+                    <div className="payment-allocation" key={`${payment.receiptId}-${allocation.scheduleId}`}>
+                      <span>
+                        #{allocation.scheduleId} · {formatDate(allocation.paymentDate) || '-'}
+                      </span>
+                      <strong>{formatMoney(allocation.paid, allocation.currency)}</strong>
+                      <em>
+                        {allocation.closed
+                          ? '\u0553\u0561\u056f\u057e\u0565\u0581'
+                          : `${'\u0544\u0576\u0561\u0581\u0578\u0580\u0564'} ${formatMoney(allocation.remainingAfter, allocation.currency)}`}
+                      </em>
+                    </div>
+                  ))}
+                  {payment.excess > 0 ? (
+                    <div className="payment-allocation excess">
+                      <span>{'\u0531\u057e\u0565\u056c\u0581\u0578\u0582\u056f'}</span>
+                      <strong>{formatMoney(payment.excess, payment.currency)}</strong>
+                      <em>{'\u0540\u0561\u057b\u0578\u0580\u0564 \u0563\u0580\u0561\u0586\u056b\u056f\u056b\u0576'}</em>
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">{'\u054e\u0573\u0561\u0580\u0578\u0582\u0574 \u0579\u056f\u0561'}</p>
+          )}
+        </div>
+
+        <div className="deal-schedules-panel">
+          <div className="section-title">
+            <CheckCircle2 size={18} />
+            <h3>Գրաֆիկներ</h3>
+          </div>
+          {deal.schedules?.length ? (
+            <div className="deal-schedule-list">
+              {deal.schedules.map((schedule) => (
+                <div className="deal-schedule-row" key={schedule.id}>
+                  <strong>#{schedule.id}</strong>
+                  <span>{formatMoney(schedule.amount, schedule.currency)}</span>
+                  <span>{formatDate(schedule.paymentDate) || '-'}</span>
+                  <span>{formatScheduleStatus(schedule.status)}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">Գրաֆիկ չկա</p>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function formatMoney(amount, currency) {
   return new Intl.NumberFormat('hy-AM').format(amount) + ` ${currency}`;
 }
@@ -731,6 +1074,13 @@ function formatDate(value) {
   }
 
   return new Date(value).toLocaleDateString('hy-AM');
+}
+
+function formatScheduleStatus(status) {
+  if (status === 'DT1052_33:CLIENT') return '\u054e\u0573\u0561\u0580\u057e\u0561\u056e';
+  if (status === 'DT1052_33:PREPARATION') return '\u0544\u0561\u057d\u0576\u0561\u056f\u056b \u057e\u0573\u0561\u0580\u057e\u0561\u056e';
+  if (status === 'DT1052_33:NEW') return '\u0549\u057e\u0573\u0561\u0580\u057e\u0561\u056e';
+  return status;
 }
 
 function ParsedBadges({ parsed }) {

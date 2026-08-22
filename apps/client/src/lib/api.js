@@ -35,12 +35,13 @@ export async function searchDeals(params, options = {}) {
   return response.json();
 }
 
-export async function confirmMatch(payload) {
+export async function confirmMatch(payload, options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/receipts/match`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
+    signal: options.signal,
     body: JSON.stringify(payload)
   });
 
