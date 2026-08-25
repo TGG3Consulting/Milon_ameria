@@ -4,16 +4,13 @@ import {
   Check,
   CheckCircle2,
   Clock3,
-  Cloud,
   Filter,
-  Link2,
   RefreshCw,
   Search,
   X
 } from 'lucide-react';
 import {
   confirmMatch,
-  getHealth,
   getReceipts,
   searchDeals
 } from './lib/api.js';
@@ -26,7 +23,6 @@ const BUILDING_OPTIONS = [
 ];
 
 export default function App() {
-  const [health, setHealth] = useState(null);
   const [board, setBoard] = useState({ unmatched: [], matched: [], log: [] });
   const [selectedReceiptId, setSelectedReceiptId] = useState('');
   const [manualFilters, setManualFilters] = useState({ name: '', building: '', apartment: '' });
@@ -81,13 +77,6 @@ export default function App() {
   async function refreshData() {
     setLoading(true);
     setError('');
-
-    try {
-      const healthData = await getHealth();
-      setHealth(healthData);
-    } catch (err) {
-      setError(err.message);
-    }
 
     try {
       const receiptData = await getReceipts();
@@ -305,18 +294,9 @@ export default function App() {
           <h1>Բանկային կտրոնների համադրում</h1>
         </div>
         <div className="top-actions">
-          <StatusPill icon={<Cloud size={16} />} label="Backend" value={health?.ok ? 'Online' : 'Checking'} />
-          <StatusPill
-            icon={<Link2 size={16} />}
-            label="Bitrix24"
-            value={health?.bitrix?.configured ? 'Webhook OK' : 'No webhook'}
-          />
-          <button className="history-button" type="button" onClick={() => setHistoryOpen(true)}>
-            <Clock3 size={16} />
+          <button className="history-button" type="button" onClick={() => setHistoryOpen(true)} aria-label="History" title="History">
+            <Clock3 size={20} />
             History
-          </button>
-          <button className="icon-button" type="button" onClick={refreshData} aria-label="Refresh">
-            <RefreshCw size={18} />
           </button>
         </div>
       </header>
@@ -376,9 +356,9 @@ export default function App() {
         <div className="activity-list">
           {board.log.map((item) => (
             <div className="activity-row" key={item.id}>
-              <span>{new Date(item.createdAt).toLocaleString('hy-AM')}</span>
+              <span>{formatArmenianDateTime(item.createdAt)}</span>
               <strong>{item.receiptId}</strong>
-              <p>{item.action}</p>
+              <p>{formatActivityAction(item.action)}</p>
             </div>
           ))}
         </div>
@@ -564,17 +544,13 @@ function SuggestionModal({
     </div>
   );
 }
-function StatusPill({ icon, label, value }) {
-  return (
-    <div className="status-pill">
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
 function HistoryModal({ log, onClose }) {
+  const [historyType, setHistoryType] = useState('matched');
+  const [dateFilter, setDateFilter] = useState({ from: '', to: '' });
+  const matchedLog = log.filter((item) => isMatchedActivity(item.action));
+  const createdLog = log.filter((item) => isCreatedReceiptActivity(item.action));
+  const visibleLog = filterHistoryByDate(historyType === 'matched' ? matchedLog : createdLog, dateFilter);
+
   return (
     <div className="suggestion-modal-backdrop" role="presentation">
       <section className="history-modal" role="dialog" aria-modal="true" aria-labelledby="history-title">
@@ -587,15 +563,51 @@ function HistoryModal({ log, onClose }) {
             <X size={18} />
           </button>
         </div>
+        <div className="history-filters" aria-label="History filters">
+          <button
+            className={historyType === 'matched' ? 'active' : ''}
+            type="button"
+            onClick={() => setHistoryType('matched')}
+          >
+            Համապատասխանեցված
+            <span>{matchedLog.length}</span>
+          </button>
+          <button
+            className={historyType === 'created' ? 'active' : ''}
+            type="button"
+            onClick={() => setHistoryType('created')}
+          >
+            Ստեղծված կտրոններ
+            <span>{createdLog.length}</span>
+          </button>
+        </div>
+        <div className="history-date-filters">
+          <label>
+            <span>Սկիզբ</span>
+            <input
+              type="date"
+              value={dateFilter.from}
+              onChange={(event) => setDateFilter((current) => ({ ...current, from: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Մինչև</span>
+            <input
+              type="date"
+              value={dateFilter.to}
+              onChange={(event) => setDateFilter((current) => ({ ...current, to: event.target.value }))}
+            />
+          </label>
+        </div>
         <div className="activity-list history-list">
-          {log.map((item) => (
+          {visibleLog.map((item) => (
             <div className="activity-row" key={item.id}>
-              <span>{new Date(item.createdAt).toLocaleString('hy-AM')}</span>
+              <span>{formatArmenianDateTime(item.createdAt)}</span>
               <strong>{item.receiptId}</strong>
-              <p>{item.action}</p>
+              <p>{formatActivityAction(item.action)}</p>
             </div>
           ))}
-          {!log.length ? <p className="muted">Պատմություն չկա</p> : null}
+          {!visibleLog.length ? <p className="muted">Պատմություն չկա</p> : null}
         </div>
       </section>
     </div>
@@ -753,6 +765,84 @@ function createEmptyColumnFilter() {
 
 function hasActiveColumnFilter(filter) {
   return Boolean(filter.dateFrom || filter.dateTo);
+}
+
+function isMatchedActivity(action) {
+  return String(action ?? '').startsWith('Receipt matched with Deal #');
+}
+
+function isCreatedReceiptActivity(action) {
+  return String(action ?? '') === 'Bank receipt was created in Bitrix';
+}
+
+function filterHistoryByDate(items, filter) {
+  return items.filter((item) => {
+    const dayKey = getArmenianDateKey(item.createdAt);
+
+    if (!dayKey) {
+      return false;
+    }
+
+    return (!filter.from || dayKey >= filter.from) && (!filter.to || dayKey <= filter.to);
+  });
+}
+
+function getArmenianDateKey(value) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    day: '2-digit',
+    month: '2-digit',
+    timeZone: 'Asia/Yerevan',
+    year: 'numeric'
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+
+  return year && month && day ? `${year}-${month}-${day}` : '';
+}
+
+function formatActivityAction(action) {
+  const value = String(action ?? '');
+  const matchedDeal = value.match(/^Receipt matched with Deal #(.+); schedules recalculated$/);
+  const syncCompleted = value.match(/^Ameriabank sync completed: (\d+) imported, (\d+) skipped$/);
+
+  if (matchedDeal) {
+    return `\u053f\u057f\u0580\u0578\u0576\u0568 \u0570\u0561\u0574\u0561\u057a\u0561\u057f\u0561\u057d\u056d\u0561\u0576\u0565\u0581\u057e\u0565\u0581 Deal #${matchedDeal[1]}-\u056b \u0570\u0565\u057f, \u057e\u0573\u0561\u0580\u0574\u0561\u0576 \u0563\u0580\u0561\u0586\u056b\u056f\u0568 \u057e\u0565\u0580\u0561\u0570\u0561\u0577\u057e\u0561\u0580\u056f\u057e\u0565\u0581`;
+  }
+
+  if (value === 'Bank receipt was created in Bitrix') {
+    return '\u0532\u0561\u0576\u056f\u0561\u0575\u056b\u0576 \u056f\u057f\u0580\u0578\u0576\u0568 \u057d\u057f\u0565\u0572\u056e\u057e\u0565\u0581 Bitrix-\u0578\u0582\u0574';
+  }
+
+  if (syncCompleted) {
+    return `Ameriabank-\u056b \u057d\u056b\u0576\u0584\u0580\u0578\u0576\u0561\u0581\u0578\u0582\u0574\u0568 \u0561\u057e\u0561\u0580\u057f\u057e\u0565\u0581. \u0576\u0565\u0580\u0574\u0578\u0582\u056e\u057e\u0565\u0581 ${syncCompleted[1]} \u056f\u057f\u0580\u0578\u0576, \u0562\u0561\u0581 \u0569\u0578\u0572\u0576\u057e\u0565\u0581 ${syncCompleted[2]}`;
+  }
+
+  return value;
+}
+
+function formatArmenianDateTime(value) {
+  if (!value) {
+    return '';
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  return new Intl.DateTimeFormat('hy-AM', {
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    timeZone: 'Asia/Yerevan'
+  }).format(date);
 }
 
 function filterReceipts(receipts, filter) {
