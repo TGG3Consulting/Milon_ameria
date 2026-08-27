@@ -926,9 +926,25 @@ function ManualSearchModal({ deals, filters, loading, confirming, selectedDeal, 
           ) : deals.map((deal) => (
             <label className="manual-result" key={deal.id}>
               <input checked={selectedDeal?.id === deal.id} onChange={() => onSelectDeal(deal)} type="checkbox" />
-              <span>
-                <strong>{deal.buyerName}</strong>
-                {deal.address}
+              <span className="manual-result-body">
+                <span className="manual-result-title">
+                  <strong>{deal.buyerName || deal.title || `Deal #${deal.id}`}</strong>
+                  <em>Deal #{deal.id}</em>
+                </span>
+                <span className="manual-result-meta">
+                  <span>
+                    <small>Բնակարան</small>
+                    <b>{deal.apartmentNumber || '-'}</b>
+                  </span>
+                  <span>
+                    <small>Շենք</small>
+                    <b>{getBuildingLabel(deal.projectId)}</b>
+                  </span>
+                  <span>
+                    <small>Գումար</small>
+                    <b>{deal.amount ? formatMoney(deal.amount, deal.currency) : '-'}</b>
+                  </span>
+                </span>
               </span>
             </label>
           ))}
@@ -1156,6 +1172,10 @@ function DealDetailsModal({ deal, onClose }) {
 
 function formatMoney(amount, currency) {
   return new Intl.NumberFormat('hy-AM').format(amount) + ` ${currency}`;
+}
+
+function getBuildingLabel(projectId) {
+  return BUILDING_OPTIONS.find((building) => building.value === String(projectId ?? ''))?.label || projectId || '-';
 }
 
 function formatDate(value) {

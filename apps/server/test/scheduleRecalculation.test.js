@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   assertDealScheduleSummaryPersisted,
   dealMatchesReceipt,
+  filterDealsForSearch,
   getDealScheduleSummaryFields,
   getDefaultStages,
   parsePurpose,
@@ -76,6 +77,27 @@ test('does not suggest a deal with a different explicit apartment number', () =>
   };
 
   assert.equal(dealMatchesReceipt(receipt, wrongApartmentDeal), false);
+});
+
+test('manual search matches apartment only against the structured deal apartment', () => {
+  const deals = [
+    {
+      id: '6653',
+      projectId: '1507',
+      apartmentNumber: '501',
+      searchableText: 'buyer apartment 501 linked receipt mentions 502'
+    },
+    {
+      id: '6655',
+      projectId: '1507',
+      apartmentNumber: '502',
+      searchableText: 'buyer apartment 502'
+    }
+  ];
+
+  const results = filterDealsForSearch(deals, { apartment: '502' });
+
+  assert.deepEqual(results.map((deal) => deal.id), ['6655']);
 });
 
 test('pays schedules in id order and marks the partially covered one', () => {

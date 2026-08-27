@@ -1279,15 +1279,73 @@ select:focus {
   min-height: auto;
 }
 
-.manual-result span {
+.manual-result-body {
   color: #64748b;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 8px;
+  min-width: 0;
 }
 
 .manual-result strong {
   color: #111827;
+}
+
+.manual-result-title {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.manual-result-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual-result-title em {
+  background: #e8f3f7;
+  border: 1px solid #cfe2ea;
+  border-radius: 999px;
+  color: #0f6d8c;
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 850;
+  padding: 3px 7px;
+}
+
+.manual-result-meta {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.manual-result-meta span {
+  background: #ffffff;
+  border: 1px solid #e4ebf2;
+  border-radius: 7px;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 8px;
+}
+
+.manual-result-meta small {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.manual-result-meta b {
+  color: #24364b;
+  font-size: 12px;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sidebar-actions {
@@ -1334,8 +1392,10 @@ select:focus {
 .history-list {
   align-content: start;
   flex: 1;
+  gap: 0;
   max-height: min(520px, calc(100vh - 180px));
   min-height: 0;
+  overflow: auto;
   padding-right: 2px;
 }
 
@@ -1406,12 +1466,13 @@ select:focus {
 }
 
 .activity-row {
-  align-items: center;
+  align-items: start;
   border-top: 1px solid #edf1f5;
   display: grid;
   gap: 8px;
   grid-template-columns: 180px 150px 1fr;
-  min-height: 32px;
+  min-height: 40px;
+  padding: 8px 0;
 }
 
 .activity-row span,
@@ -1420,7 +1481,29 @@ select:focus {
 }
 
 .activity-row p {
+  line-height: 1.35;
   margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-list .activity-row {
+  align-items: start;
+  border-top: 0;
+  border-bottom: 1px solid #edf1f5;
+  column-gap: 14px;
+  grid-template-columns: 175px 56px minmax(0, 1fr);
+  min-height: auto;
+  padding: 7px 0;
+}
+
+.history-list .activity-row span,
+.history-list .activity-row strong {
+  line-height: 1.3;
+}
+
+.history-list .activity-row p {
+  line-height: 1.3;
 }
 
 @media (max-width: 1180px) {

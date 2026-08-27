@@ -302,6 +302,10 @@ async function createBankReceiptOnce(transaction) {
 
 export async function searchDeals({ name = '', building = '', apartment = '' }) {
   const deals = await listRecentDeals();
+  return filterDealsForSearch(deals, { name, building, apartment });
+}
+
+export function filterDealsForSearch(deals, { name = '', building = '', apartment = '' }) {
   const queryName = normalize(name);
   const queryNameAlt = normalize(transliterateLatinToArmenian(name));
   const queryBuilding = String(building ?? '').trim();
@@ -309,10 +313,9 @@ export async function searchDeals({ name = '', building = '', apartment = '' }) 
 
   return deals.filter((deal) => {
     const haystack = deal.searchableText;
-    const tokens = getNumberTokens(haystack);
     const byName = !queryName || includesText(haystack, queryName) || (queryNameAlt && includesText(haystack, queryNameAlt));
     const byBuilding = !queryBuilding || deal.projectId === queryBuilding;
-    const byApartment = !queryApartment || tokens.has(queryApartment) || includesText(haystack, queryApartment);
+    const byApartment = !queryApartment || dealApartmentMatchesSearch(queryApartment, deal);
 
     return byName && byBuilding && byApartment;
   });
@@ -1326,6 +1329,14 @@ function apartmentMatchesDeal(parsedApartment, deal) {
     parsedApartment &&
     deal?.apartmentNumber &&
     canonicalizeNumeric(parsedApartment) === canonicalizeNumeric(deal.apartmentNumber)
+  );
+}
+
+function dealApartmentMatchesSearch(queryApartment, deal) {
+  return Boolean(
+    queryApartment &&
+    deal?.apartmentNumber &&
+    canonicalizeNumeric(queryApartment) === canonicalizeNumeric(deal.apartmentNumber)
   );
 }
 
