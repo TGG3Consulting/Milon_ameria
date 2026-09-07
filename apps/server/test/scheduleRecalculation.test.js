@@ -154,3 +154,31 @@ test('keeps a partially paid schedule partial when only part of the remainder is
 test('produces no updates when nothing is paid yet', () => {
   assert.deepEqual(planScheduleUpdates([makeSchedule(1, 100000)], 0, stages), []);
 });
+
+test('moves a paid schedule back to partial when recalculated total no longer covers it', () => {
+  const paid = { ...makeSchedule(1, 100000, stages.schedule.paid), remaining: 0, partialPaid: 0, remainingRaw: '', partialPaidRaw: '' };
+  const updates = planScheduleUpdates([paid], 40000, stages);
+
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].fields.stageId, stages.schedule.partial);
+  assert.equal(updates[0].fields.ufCrm17_1785747159082, 40000);
+  assert.equal(updates[0].fields.ufCrm17_1785747288489, 60000);
+});
+
+test('moves paid and partial schedules back to unpaid when recalculated total is zero', () => {
+  const paid = { ...makeSchedule(1, 100000, stages.schedule.paid), remaining: 0, partialPaid: 0, remainingRaw: '', partialPaidRaw: '' };
+  const partial = { ...makeSchedule(2, 100000, stages.schedule.partial), remaining: 60000, partialPaid: 40000, remainingRaw: 60000, partialPaidRaw: 40000 };
+  const updates = planScheduleUpdates([paid, partial], 0, stages);
+
+  assert.deepEqual(
+    updates.map((update) => [update.schedule.id, update.fields.stageId]),
+    [
+      ['1', stages.schedule.unpaid],
+      ['2', stages.schedule.unpaid]
+    ]
+  );
+  assert.equal(updates[0].fields.ufCrm17_1785747159082, '');
+  assert.equal(updates[0].fields.ufCrm17_1785747288489, '');
+  assert.equal(updates[1].fields.ufCrm17_1785747159082, '');
+  assert.equal(updates[1].fields.ufCrm17_1785747288489, '');
+});

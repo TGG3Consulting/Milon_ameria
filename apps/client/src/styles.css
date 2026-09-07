@@ -401,9 +401,21 @@ select:focus {
 
 .cancel-pending-button {
   color: #9a3412;
-  margin-left: auto;
+  flex: 1;
   min-height: 34px;
   padding: 7px 10px;
+}
+
+button,
+a.bitrix-link-button {
+  text-decoration: none;
+}
+
+.send-now-button {
+  flex: 1.2;
+  min-height: 34px;
+  padding: 7px 10px;
+  white-space: nowrap;
 }
 
 .suggestion-modal-head {
@@ -420,13 +432,20 @@ select:focus {
   margin: 0;
 }
 
-.suggestion-modal-head > span {
+.suggestion-modal-head > span,
+.suggestion-modal-counter {
   background: #e8f3f7;
   border: 1px solid #cfe2ea;
   border-radius: 999px;
   color: #0f6d8c;
   font-weight: 850;
   padding: 5px 10px;
+}
+
+.suggestion-modal-head-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
 }
 
 .suggestion-modal-grid {
@@ -620,6 +639,37 @@ select:focus {
   min-height: 46px;
   padding: 0;
   width: 46px;
+}
+
+.smart-match-button {
+  align-items: center;
+  background: #0f6d8c;
+  border: 1px solid #0f6d8c;
+  box-shadow: 0 8px 18px rgba(15, 109, 140, 0.22);
+  color: #ffffff;
+  display: inline-flex;
+  font-weight: 850;
+  gap: 8px;
+  min-height: 46px;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+.smart-match-button:hover {
+  background: #0b5d78;
+  border-color: #0b5d78;
+}
+
+.smart-match-button span {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 13px;
+  justify-content: center;
+  min-width: 24px;
+  padding: 2px 7px;
 }
 
 .history-button:hover {
@@ -1096,6 +1146,23 @@ select:focus {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.deal-details-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.bitrix-link-button {
+  align-items: center;
+  border-radius: 8px;
+  display: inline-flex;
+  font-weight: 760;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
 .deal-detail-field {
   background: #f8fafc;
   border: 1px solid #dce4ec;
@@ -1404,13 +1471,15 @@ select:focus {
   margin: 12px 0;
 }
 
-.history-filters {
+.history-filters,
+.history-action-filters {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
 
-.history-filters button {
+.history-filters button,
+.history-action-filters button {
   background: #f8fafc;
   border: 1px solid #dce4ec;
   color: #536985;
@@ -1420,7 +1489,9 @@ select:focus {
 }
 
 .history-filters button:hover,
-.history-filters button.active {
+.history-filters button.active,
+.history-action-filters button:hover,
+.history-action-filters button.active {
   background: #e8f3f7;
   border-color: #0f6d8c;
   box-shadow: none;
@@ -1428,7 +1499,8 @@ select:focus {
   transform: none;
 }
 
-.history-filters span {
+.history-filters span,
+.history-action-filters span {
   align-items: center;
   background: #ffffff;
   border: 1px solid #dce4ec;
@@ -1441,6 +1513,11 @@ select:focus {
   justify-content: center;
   min-width: 20px;
   padding: 0 6px;
+}
+
+.history-action-filters button {
+  font-size: 12px;
+  min-height: 30px;
 }
 
 .history-date-filters {
@@ -1463,6 +1540,34 @@ select:focus {
 
 .history-date-filters input {
   min-height: 32px;
+}
+
+.history-summary {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.history-summary div {
+  background: #f8fafc;
+  border: 1px solid #dce4ec;
+  border-radius: 8px;
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+}
+
+.history-summary span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.history-summary strong {
+  color: #0f172a;
+  font-size: 16px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .activity-row {
@@ -1492,9 +1597,13 @@ select:focus {
   border-top: 0;
   border-bottom: 1px solid #edf1f5;
   column-gap: 14px;
-  grid-template-columns: 175px 56px minmax(0, 1fr);
+  grid-template-columns: 175px minmax(180px, 260px) minmax(0, 1fr);
   min-height: auto;
   padding: 7px 0;
+}
+
+.history-list .activity-row.with-action {
+  grid-template-columns: 175px minmax(180px, 260px) minmax(0, 1fr) auto;
 }
 
 .history-list .activity-row span,
@@ -1502,8 +1611,22 @@ select:focus {
   line-height: 1.3;
 }
 
+.history-list .activity-row strong {
+  overflow-wrap: anywhere;
+}
+
 .history-list .activity-row p {
   line-height: 1.3;
+}
+
+.history-undo-button {
+  align-self: center;
+  min-height: 30px;
+  white-space: nowrap;
+}
+
+.history-undo-button:disabled svg {
+  animation: spin 0.9s linear infinite;
 }
 
 @media (max-width: 1180px) {
@@ -1549,7 +1672,8 @@ select:focus {
   .deal-schedule-row,
   .payment-allocation,
   .payment-step-head,
-  .sidebar-actions {
+  .sidebar-actions,
+  .history-list .activity-row.with-action {
     grid-template-columns: 1fr;
   }
 

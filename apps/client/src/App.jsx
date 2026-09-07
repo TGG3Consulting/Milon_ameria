@@ -4,6 +4,7 @@ import {
   Check,
   CheckCircle2,
   Clock3,
+  ExternalLink,
   Filter,
   RefreshCw,
   Search,
@@ -12,7 +13,8 @@ import {
 import {
   confirmMatch,
   getReceipts,
-  searchDeals
+  searchDeals,
+  undoMatch
 } from './lib/api.js';
 import './styles.css';
 
@@ -39,6 +41,7 @@ export default function App() {
   const [viewedDeal, setViewedDeal] = useState(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [confirmingReceiptIds, setConfirmingReceiptIds] = useState([]);
+  const [undoingReceiptIds, setUndoingReceiptIds] = useState([]);
   const [pendingMatches, setPendingMatches] = useState([]);
   const [processingMatches, setProcessingMatches] = useState([]);
   const [openFilterKey, setOpenFilterKey] = useState('');
@@ -58,7 +61,7 @@ export default function App() {
   );
   const selectedReceipt =
     visibleUnmatched.find((receipt) => receipt.id === selectedReceiptId) ?? visibleUnmatched[0] ?? board.unmatched[0] ?? null;
-  const receiptQueue = board.unmatched.filter((receipt) => receipt.suggestions?.length);
+  const receiptQueue = board.unmatched.filter((receipt) => receipt.suggestions?.length && !isMatchQueued(receipt.id));
   const activeReceipt = suggestionModalClosed ? null : receiptQueue[receiptQueueIndex] ?? null;
   const selectedModalSuggestion =
     activeReceipt?.suggestions.find((suggestion) => getSuggestionId(suggestion) === selectedSuggestionId) ??
@@ -159,6 +162,29 @@ export default function App() {
     setPendingMatches((current) => current.filter((match) => match.jobKey !== jobKey));
   }
 
+  function startMatchNow(match) {
+    const controller = new AbortController();
+    const processingMatch = { ...match, seconds: null, controller };
+    setProcessingMatches((processing) =>
+      processing.some((item) => item.jobKey === processingMatch.jobKey)
+        ? processing
+        : [...processing, processingMatch]
+    );
+    executeConfirm(processingMatch);
+  }
+
+  function sendPendingMatchNow(jobKey) {
+    setPendingMatches((current) => {
+      const match = current.find((item) => item.jobKey === jobKey);
+
+      if (match) {
+        startMatchNow(match);
+      }
+
+      return current.filter((item) => item.jobKey !== jobKey);
+    });
+  }
+
   function cancelProcessingMatch(jobKey) {
     setProcessingMatches((current) => {
       const match = current.find((item) => item.jobKey === jobKey);
@@ -175,6 +201,29 @@ export default function App() {
     });
   }
 
+  async function handleUndoMatch(receiptId, dealId) {
+    const nextReceiptId = receiptId ? String(receiptId) : '';
+
+    setError('');
+
+    if (!nextReceiptId || undoingReceiptIds.includes(nextReceiptId) || confirmingReceiptIds.includes(nextReceiptId)) {
+      return false;
+    }
+
+    setUndoingReceiptIds((current) => [...current, nextReceiptId]);
+
+    try {
+      await undoMatch({ receiptId: nextReceiptId, dealId });
+      await refreshData();
+      return true;
+    } catch (err) {
+      setError(err.message);
+      return false;
+    } finally {
+      setUndoingReceiptIds((current) => current.filter((id) => id !== nextReceiptId));
+    }
+  }
+
   async function handleAcceptSuggestion() {
     if (!activeReceipt || !selectedModalSuggestion) {
       return;
@@ -189,25 +238,43 @@ export default function App() {
         scheduleIds: selectedModalSuggestion.scheduleIds
       });
       if (confirmed) {
-        setReceiptQueueIndex(0);
-        setSelectedSuggestionId('');
-        setSuggestionModalClosed(true);
+        advanceSuggestionModal();
       }
     } finally {
       setSuggestionAccepting(false);
     }
   }
 
-  function handleSkipReceiptSuggestions() {
+  function advanceSuggestionModal() {
     const nextIndex = receiptQueueIndex + 1;
 
     if (nextIndex >= receiptQueue.length) {
       setSuggestionModalClosed(true);
+      setSelectedSuggestionId('');
       return;
     }
 
     setReceiptQueueIndex(nextIndex);
     setSelectedSuggestionId('');
+  }
+
+  function handleSkipReceiptSuggestions() {
+    advanceSuggestionModal();
+  }
+
+  function handleCloseReceiptSuggestions() {
+    setSuggestionModalClosed(true);
+    setSelectedSuggestionId('');
+  }
+
+  function handleOpenReceiptSuggestions() {
+    if (!receiptQueue.length) {
+      return;
+    }
+
+    setReceiptQueueIndex((currentIndex) => (currentIndex < receiptQueue.length ? currentIndex : 0));
+    setSelectedSuggestionId('');
+    setSuggestionModalClosed(false);
   }
 
   useEffect(() => {
@@ -232,10 +299,7 @@ export default function App() {
         }
 
         for (const match of ready) {
-          const controller = new AbortController();
-          const processingMatch = { ...match, controller };
-          setProcessingMatches((processing) => [...processing, processingMatch]);
-          executeConfirm(processingMatch);
+          startMatchNow(match);
         }
 
         return waiting;
@@ -294,6 +358,18 @@ export default function App() {
           <h1>Բանկային կտրոնների համադրում</h1>
         </div>
         <div className="top-actions">
+          {receiptQueue.length ? (
+            <button
+              className="smart-match-button"
+              type="button"
+              onClick={handleOpenReceiptSuggestions}
+              aria-label="Բացել խելացի առաջարկները"
+              title="Բացել խելացի առաջարկները"
+            >
+              <CheckCircle2 size={20} />
+              <span>{receiptQueue.length}</span>
+            </button>
+          ) : null}
           <button className="history-button" type="button" onClick={() => setHistoryOpen(true)} aria-label="History" title="History">
             <Clock3 size={20} />
             History
@@ -377,6 +453,7 @@ export default function App() {
           onAccept={handleAcceptSuggestion}
           onDealView={setViewedDeal}
           onSelectSuggestion={setSelectedSuggestionId}
+          onClose={handleCloseReceiptSuggestions}
           onSkip={handleSkipReceiptSuggestions}
         />
       ) : null}
@@ -401,7 +478,15 @@ export default function App() {
         />
       ) : null}
       {viewedDeal ? <DealDetailsModal deal={viewedDeal} onClose={() => setViewedDeal(null)} /> : null}
-      {historyOpen ? <HistoryModal log={board.log} onClose={() => setHistoryOpen(false)} /> : null}
+      {historyOpen ? (
+        <HistoryModal
+          log={board.log}
+          onClose={() => setHistoryOpen(false)}
+          receipts={[...board.unmatched, ...board.matched]}
+          onUndoMatch={handleUndoMatch}
+          undoingReceiptIds={undoingReceiptIds}
+        />
+      ) : null}
       {pendingMatches.length || processingMatches.length ? (
         <div className="pending-match-stack">
           {pendingMatches.length + processingMatches.length > 1 ? (
@@ -416,6 +501,7 @@ export default function App() {
               match={match}
               seconds={match.seconds}
               onCancel={() => cancelPendingMatch(match.jobKey)}
+              onSendNow={() => sendPendingMatchNow(match.jobKey)}
             />
           ))}
           {processingMatches.map((match) => (
@@ -463,6 +549,7 @@ function SuggestionModal({
   onAccept,
   onDealView,
   onSelectSuggestion,
+  onClose,
   onSkip
 }) {
   return (
@@ -473,9 +560,14 @@ function SuggestionModal({
             <p className="eyebrow">Smart Match</p>
             <h2 id="suggestion-modal-title">{'\u053d\u0565\u056c\u0561\u0581\u056b \u0561\u057c\u0561\u057b\u0561\u0580\u056f\u0576\u0565\u0580'}</h2>
           </div>
-          <span>
-            {index + 1} / {total}
-          </span>
+          <div className="suggestion-modal-head-actions">
+            <span className="suggestion-modal-counter">
+              {index + 1} / {total}
+            </span>
+            <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Փակել" title="Փակել">
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         <div className="modal-receipt">
@@ -544,12 +636,19 @@ function SuggestionModal({
     </div>
   );
 }
-function HistoryModal({ log, onClose }) {
+function HistoryModal({ log, onClose, receipts, onUndoMatch, undoingReceiptIds }) {
   const [historyType, setHistoryType] = useState('matched');
+  const [matchActionFilter, setMatchActionFilter] = useState('all');
   const [dateFilter, setDateFilter] = useState({ from: '', to: '' });
-  const matchedLog = log.filter((item) => isMatchedActivity(item.action));
+  const receiptById = new Map(receipts.map((receipt) => [String(receipt.id), receipt]));
+  const matchHistoryLog = log.filter((item) => isMatchHistoryActivity(item.action));
+  const filteredMatchHistoryLog = filterMatchHistoryByAction(matchHistoryLog, matchActionFilter);
+  const undoableActivityIds = getUndoableMatchActivityIds(matchHistoryLog);
   const createdLog = log.filter((item) => isCreatedReceiptActivity(item.action));
-  const visibleLog = filterHistoryByDate(historyType === 'matched' ? matchedLog : createdLog, dateFilter);
+  const visibleLog = filterHistoryByDate(historyType === 'matched' ? filteredMatchHistoryLog : createdLog, dateFilter);
+  const visibleSummary = getHistoryAmountSummary(visibleLog, receiptById);
+  const matchedCount = matchHistoryLog.filter((item) => getMatchedDealId(item.action)).length;
+  const unlinkedCount = matchHistoryLog.filter((item) => getUnlinkedDealId(item.action)).length;
 
   return (
     <div className="suggestion-modal-backdrop" role="presentation">
@@ -570,7 +669,7 @@ function HistoryModal({ log, onClose }) {
             onClick={() => setHistoryType('matched')}
           >
             Համապատասխանեցված
-            <span>{matchedLog.length}</span>
+            <span>{matchHistoryLog.length}</span>
           </button>
           <button
             className={historyType === 'created' ? 'active' : ''}
@@ -581,6 +680,34 @@ function HistoryModal({ log, onClose }) {
             <span>{createdLog.length}</span>
           </button>
         </div>
+        {historyType === 'matched' ? (
+          <div className="history-action-filters" aria-label="Match history action filters">
+            <button
+              className={matchActionFilter === 'all' ? 'active' : ''}
+              type="button"
+              onClick={() => setMatchActionFilter('all')}
+            >
+              {'\u0532\u0578\u056c\u0578\u0580\u0568'}
+              <span>{matchHistoryLog.length}</span>
+            </button>
+            <button
+              className={matchActionFilter === 'matched' ? 'active' : ''}
+              type="button"
+              onClick={() => setMatchActionFilter('matched')}
+            >
+              {'\u0540\u0561\u0574\u0561\u057a\u0561\u057f\u0561\u057d\u056d\u0561\u0576\u0565\u0581\u057e\u0561\u056e'}
+              <span>{matchedCount}</span>
+            </button>
+            <button
+              className={matchActionFilter === 'unlinked' ? 'active' : ''}
+              type="button"
+              onClick={() => setMatchActionFilter('unlinked')}
+            >
+              {'\u0540\u0565\u057f \u057f\u0561\u0580\u057e\u0561\u056e'}
+              <span>{unlinkedCount}</span>
+            </button>
+          </div>
+        ) : null}
         <div className="history-date-filters">
           <label>
             <span>Սկիզբ</span>
@@ -599,14 +726,37 @@ function HistoryModal({ log, onClose }) {
             />
           </label>
         </div>
+        <div className="history-summary">
+          <div>
+            <span>{'\u0533\u0578\u0582\u0574\u0561\u0580'}</span>
+            <strong>{visibleSummary.totalLabel}</strong>
+          </div>
+        </div>
         <div className="activity-list history-list">
-          {visibleLog.map((item) => (
-            <div className="activity-row" key={item.id}>
-              <span>{formatArmenianDateTime(item.createdAt)}</span>
-              <strong>{item.receiptId}</strong>
-              <p>{formatActivityAction(item.action)}</p>
-            </div>
-          ))}
+          {visibleLog.map((item) => {
+            const dealId = getMatchedDealId(item.action);
+            const canUndo = historyType === 'matched' && dealId && undoableActivityIds.has(item.id);
+            const undoing = undoingReceiptIds.includes(String(item.receiptId));
+
+            return (
+              <div className={`activity-row ${canUndo ? 'with-action' : ''}`} key={item.id}>
+                <span>{formatArmenianDateTime(item.createdAt)}</span>
+                <strong>{getReceiptHistoryTitle(item, receiptById)}</strong>
+                <p>{formatActivityAction(item.action)}</p>
+                {canUndo ? (
+                  <button
+                    className="secondary history-undo-button"
+                    disabled={undoing}
+                    type="button"
+                    onClick={() => onUndoMatch(item.receiptId, dealId)}
+                  >
+                    {undoing ? <RefreshCw size={15} /> : <X size={15} />}
+                    {undoing ? '\u0540\u0565\u057f \u0567 \u057f\u0561\u0580\u057e\u0578\u0582\u0574' : '\u0540\u0565\u057f \u057f\u0561\u0576\u0565\u056c'}
+                  </button>
+                ) : null}
+              </div>
+            );
+          })}
           {!visibleLog.length ? <p className="muted">Պատմություն չկա</p> : null}
         </div>
       </section>
@@ -614,7 +764,7 @@ function HistoryModal({ log, onClose }) {
   );
 }
 
-function PendingMatchModal({ match, seconds, onCancel }) {
+function PendingMatchModal({ match, seconds, onCancel, onSendNow }) {
   const isProcessing = seconds === null;
 
   return (
@@ -639,6 +789,12 @@ function PendingMatchModal({ match, seconds, onCancel }) {
           </p>
         </div>
         <div className="suggestion-modal-actions">
+          {!isProcessing ? (
+            <button className="send-now-button" type="button" onClick={onSendNow}>
+              <Check size={16} />
+              {'\u0548\u0582\u0572\u0561\u0580\u056f\u0565\u056c \u0570\u056b\u0574\u0561'}
+            </button>
+          ) : null}
           <button className="secondary cancel-pending-button" type="button" onClick={onCancel}>
             <X size={16} />
             Cancel
@@ -767,8 +923,86 @@ function hasActiveColumnFilter(filter) {
   return Boolean(filter.dateFrom || filter.dateTo);
 }
 
-function isMatchedActivity(action) {
-  return String(action ?? '').startsWith('Receipt matched with Deal #');
+function isMatchHistoryActivity(action) {
+  return Boolean(getMatchedDealId(action) || getUnlinkedDealId(action));
+}
+
+function filterMatchHistoryByAction(items, filter) {
+  if (filter === 'matched') {
+    return items.filter((item) => getMatchedDealId(item.action));
+  }
+
+  if (filter === 'unlinked') {
+    return items.filter((item) => getUnlinkedDealId(item.action));
+  }
+
+  return items;
+}
+
+function getReceiptHistoryTitle(item, receiptById) {
+  const receipt = receiptById.get(String(item.receiptId));
+  return receipt?.bitrixTitle || receipt?.bankTransactionId || `#${item.receiptId}`;
+}
+
+function getHistoryAmountSummary(items, receiptById) {
+  const totalsByCurrency = new Map();
+
+  for (const item of items) {
+    const receipt = receiptById.get(String(item.receiptId));
+    const amount = Number(receipt?.amount ?? 0);
+
+    if (!receipt || !Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    const currency = receipt.currency || 'AMD';
+    totalsByCurrency.set(currency, (totalsByCurrency.get(currency) ?? 0) + amount);
+  }
+
+  const totalLabel = [...totalsByCurrency.entries()]
+    .map(([currency, amount]) => formatMoney(amount, currency))
+    .join(', ');
+
+  return {
+    totalLabel: totalLabel || formatMoney(0, 'AMD')
+  };
+}
+
+function getUndoableMatchActivityIds(items) {
+  const latestByPair = new Map();
+
+  for (const item of items) {
+    const matchedDealId = getMatchedDealId(item.action);
+    const unlinkedDealId = getUnlinkedDealId(item.action);
+    const dealId = matchedDealId || unlinkedDealId;
+
+    if (!dealId) {
+      continue;
+    }
+
+    const key = `${item.receiptId}:${dealId}`;
+    const current = latestByPair.get(key);
+    const currentTime = current ? new Date(current.createdAt).getTime() : -Infinity;
+    const itemTime = new Date(item.createdAt).getTime();
+
+    if (!current || itemTime >= currentTime) {
+      latestByPair.set(key, item);
+    }
+  }
+
+  return new Set(
+    [...latestByPair.values()]
+      .filter((item) => getMatchedDealId(item.action))
+      .map((item) => item.id)
+  );
+}
+
+function getMatchedDealId(action) {
+  return String(action ?? '').match(/^Receipt matched with Deal #(.+); schedules recalculated$/)?.[1] ?? '';
+}
+
+function getUnlinkedDealId(action) {
+  return String(action ?? '').match(/^Receipt unlinked from Deal #(.+); schedules recalculated$/)?.[1] ?? '';
 }
 
 function isCreatedReceiptActivity(action) {
@@ -810,6 +1044,7 @@ function getArmenianDateKey(value) {
 function formatActivityAction(action) {
   const value = String(action ?? '');
   const matchedDeal = value.match(/^Receipt matched with Deal #(.+); schedules recalculated$/);
+  const unlinkedDeal = value.match(/^Receipt unlinked from Deal #(.+); schedules recalculated$/);
   const syncCompleted = value.match(/^Ameriabank sync completed: (\d+) imported, (\d+) skipped$/);
 
   if (matchedDeal) {
@@ -818,6 +1053,10 @@ function formatActivityAction(action) {
 
   if (value === 'Bank receipt was created in Bitrix') {
     return '\u0532\u0561\u0576\u056f\u0561\u0575\u056b\u0576 \u056f\u057f\u0580\u0578\u0576\u0568 \u057d\u057f\u0565\u0572\u056e\u057e\u0565\u0581 Bitrix-\u0578\u0582\u0574';
+  }
+
+  if (unlinkedDeal) {
+    return `\u053f\u057f\u0580\u0578\u0576\u0568 \u0570\u0565\u057f \u057f\u0561\u0580\u057e\u0565\u0581 Deal #${unlinkedDeal[1]}-\u056b\u0581, \u057e\u0573\u0561\u0580\u0574\u0561\u0576 \u0563\u0580\u0561\u0586\u056b\u056f\u0568 \u057e\u0565\u0580\u0561\u0570\u0561\u0577\u057e\u0561\u0580\u056f\u057e\u0565\u0581`;
   }
 
   if (syncCompleted) {
@@ -1086,9 +1325,17 @@ function DealDetailsModal({ deal, onClose }) {
             <p className="eyebrow">Deal Details</p>
             <h2 id="deal-details-title">{deal.buyerName || deal.title || `Deal #${deal.id}`}</h2>
           </div>
-          <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Close">
-            <X size={18} />
-          </button>
+          <div className="deal-details-actions">
+            {deal.bitrixUrl ? (
+              <a className="secondary bitrix-link-button" href={deal.bitrixUrl} target="_blank" rel="noreferrer">
+                <ExternalLink size={16} />
+                Bitrix
+              </a>
+            ) : null}
+            <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Close">
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         <div className="deal-details-grid">

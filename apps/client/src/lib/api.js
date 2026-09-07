@@ -52,3 +52,21 @@ export async function confirmMatch(payload, options = {}) {
 
   return response.json();
 }
+
+export async function undoMatch(payload, options = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/receipts/match/undo`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    signal: options.signal,
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? 'Match undo failed');
+  }
+
+  return response.json();
+}

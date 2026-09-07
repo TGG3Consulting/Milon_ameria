@@ -347,6 +347,21 @@ export async function confirmMatch(payload) {
   return matchPromise;
 }
 
+export async function undoMatch(payload) {
+  const receiptId = String(payload.receiptId);
+  const previous = matchLocks.get(receiptId);
+
+  if (previous) {
+    return previous.promise.then(() => undoMatchOnce(payload));
+  }
+
+  const undoPromise = undoMatchOnce(payload).finally(() => {
+    matchLocks.delete(receiptId);
+  });
+  matchLocks.set(receiptId, { dealId: null, promise: undoPromise });
+  return undoPromise;
+}
+
 async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
   const [stages, deal, receipt] = await Promise.all([
     getStages(),
@@ -430,6 +445,87 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
 
     if (rollbackErrors.length) {
       error.message = `${error.message}; rollback failed: ${rollbackErrors.map((item) => item.message).join('; ')}`;
+    }
+    throw error;
+  }
+}
+
+async function undoMatchOnce({ receiptId, dealId: requestedDealId }) {
+  const [stages, receipt] = await Promise.all([
+    getStages(),
+    getBitrixVoucher(receiptId)
+  ]);
+  const linkedDealId = String(receipt?.parentId2 ?? '');
+  const dealId = linkedDealId || String(requestedDealId ?? '');
+
+  assertUndoEntities({ receipt, receiptId, dealId, linkedDealId, stages });
+
+  const deal = await getBitrixDeal(dealId);
+  const previousReceiptIds = deal?.[DEAL_FIELDS.receiptIds] ?? [];
+  const receiptIds = removeId(previousReceiptIds, receiptId);
+  const shouldUpdateReceipt = linkedDealId || receipt.stageId !== stages.voucher.new || receipt.contactId;
+  const previousReceiptFields = {
+    stageId: receipt.stageId,
+    parentId2: receipt.parentId2 ?? null,
+    contactId: receipt.contactId ?? null
+  };
+  let dealUpdated = false;
+  let receiptUpdated = false;
+
+  try {
+    await updateDealFields(dealId, {
+      [DEAL_FIELDS.receiptIds]: receiptIds
+    });
+    dealUpdated = true;
+
+    if (shouldUpdateReceipt) {
+      await callBitrixMethod('crm.item.update', {
+        entityTypeId: TYPES.voucher.entityTypeId,
+        id: receiptId,
+        fields: {
+          stageId: stages.voucher.new,
+          parentId2: null,
+          contactId: null
+        }
+      });
+      receiptUpdated = true;
+    }
+
+    const recalculation = await recalculateDealSchedules(deal, stages, receiptIds, {
+      excludeReceiptIds: [receiptId]
+    });
+
+    if (linkedDealId) {
+      await addActivity({
+        receiptId,
+        action: `Receipt unlinked from Deal #${dealId}; schedules recalculated`,
+        actor: 'Manager'
+      });
+    }
+
+    return {
+      id: receiptId,
+      unmatchedDealId: dealId,
+      recalculation
+    };
+  } catch (error) {
+    const rollbackErrors = [];
+
+    if (receiptUpdated) {
+      await callBitrixMethod('crm.item.update', {
+        entityTypeId: TYPES.voucher.entityTypeId,
+        id: receiptId,
+        fields: previousReceiptFields
+      }).catch((rollbackError) => rollbackErrors.push(rollbackError));
+    }
+    if (dealUpdated) {
+      await updateDealFields(dealId, {
+        [DEAL_FIELDS.receiptIds]: previousReceiptIds
+      }).catch((rollbackError) => rollbackErrors.push(rollbackError));
+    }
+
+    if (rollbackErrors.length) {
+      error.message = `${error.message}; undo rollback failed: ${rollbackErrors.map((item) => item.message).join('; ')}`;
     }
     throw error;
   }
@@ -586,6 +682,7 @@ function buildSuggestionDeal(deal, schedules = [], receipts = [], stages = getDe
 
   return {
     id: deal.id,
+    bitrixUrl: deal.bitrixUrl,
     title: deal.title,
     buyerName: deal.buyerName,
     address: deal.address,
@@ -795,6 +892,7 @@ function mapDeal(deal) {
 
   return {
     id: String(deal.ID),
+    bitrixUrl: getBitrixDealUrl(deal.ID),
     title,
     buyerName,
     address: title,
@@ -810,6 +908,15 @@ function mapDeal(deal) {
     area: String(flattenValue(deal[DEAL_FIELDS.area])).trim(),
     searchableText
   };
+}
+
+function getBitrixDealUrl(dealId) {
+  if (!env.BITRIX_WEBHOOK_URL || !dealId) {
+    return '';
+  }
+
+  const { origin } = new URL(env.BITRIX_WEBHOOK_URL);
+  return `${origin}/crm/deal/details/${dealId}/`;
 }
 
 function mapBankTransactionToVoucherFields(transaction, stages) {
@@ -861,6 +968,18 @@ function assertMatchEntities({ deal, receipt, dealId, stages }) {
   }
   if (receipt.stageId !== stages.voucher.new) {
     throw requestError('Only unmatched bank receipts can be confirmed', 409);
+  }
+}
+
+function assertUndoEntities({ receipt, receiptId, dealId, linkedDealId, stages }) {
+  if (Number(receipt?.categoryId) !== TYPES.voucher.categoryId) {
+    throw requestError('Selected receipt is outside the bank receipt Smart Process');
+  }
+  if (!dealId) {
+    throw requestError(`Receipt #${receiptId} is not linked to a deal`, 409);
+  }
+  if (linkedDealId && receipt.stageId !== stages.voucher.matched) {
+    throw requestError('Only matched bank receipts can be moved back', 409);
   }
 }
 
@@ -916,6 +1035,11 @@ function appendUniqueId(value, id) {
   return next;
 }
 
+function removeId(value, id) {
+  const normalizedId = String(id);
+  return normalizeIdList(value).filter((item) => item !== normalizedId);
+}
+
 function normalizeIdList(value) {
   if (value === false || value === null || value === undefined || value === '') {
     return [];
@@ -928,10 +1052,10 @@ function normalizeIdList(value) {
     .filter((item) => /^\d+$/u.test(item));
 }
 
-async function recalculateDealSchedules(deal, stages, linkedReceiptIds = []) {
+async function recalculateDealSchedules(deal, stages, linkedReceiptIds = [], options = {}) {
   const dealId = String(deal?.ID ?? deal?.id ?? '');
   const [vouchers, schedules] = await Promise.all([
-    listDealVouchers(dealId, linkedReceiptIds),
+    listDealVouchers(dealId, linkedReceiptIds, options),
     listDealSchedulesForRecalculation(deal)
   ]);
   const amdTotal = sumAmdVouchers(vouchers);
@@ -1096,33 +1220,60 @@ export function planScheduleUpdates(schedules, amdTotal, stages) {
     const amount = Number(schedule.amount ?? 0);
     const paid = Math.min(available, amount);
     available = Math.max(available - amount, 0);
+    const fields = getDesiredScheduleFields({ amount, paid, stages });
 
-    if (schedule.status === stages.schedule.paid) {
-      continue;
-    }
-
-    if (paid >= amount && amount > 0) {
-      updates.push({ schedule, fields: {
-        stageId: stages.schedule.paid,
-        [TYPES.schedule.fields.partialPaid]: '',
-        [TYPES.schedule.fields.remaining]: ''
-      }});
-    } else if (paid > 0) {
-      updates.push({ schedule, fields: {
-        stageId: stages.schedule.partial,
-        [TYPES.schedule.fields.partialPaid]: paid,
-        [TYPES.schedule.fields.remaining]: amount - paid
-      }});
-    } else if (schedule.status === stages.schedule.partial) {
-      updates.push({ schedule, fields: {
-        stageId: stages.schedule.unpaid,
-        [TYPES.schedule.fields.partialPaid]: '',
-        [TYPES.schedule.fields.remaining]: ''
-      }});
+    if (shouldUpdateSchedule(schedule, fields)) {
+      updates.push({ schedule, fields });
     }
   }
 
   return updates;
+}
+
+function getDesiredScheduleFields({ amount, paid, stages }) {
+  if (paid >= amount && amount > 0) {
+    return {
+      stageId: stages.schedule.paid,
+      [TYPES.schedule.fields.partialPaid]: '',
+      [TYPES.schedule.fields.remaining]: ''
+    };
+  }
+
+  if (paid > 0) {
+    return {
+      stageId: stages.schedule.partial,
+      [TYPES.schedule.fields.partialPaid]: paid,
+      [TYPES.schedule.fields.remaining]: amount - paid
+    };
+  }
+
+  return {
+    stageId: stages.schedule.unpaid,
+    [TYPES.schedule.fields.partialPaid]: '',
+    [TYPES.schedule.fields.remaining]: ''
+  };
+}
+
+function shouldUpdateSchedule(schedule, fields) {
+  if (schedule.status !== fields.stageId) {
+    return true;
+  }
+
+  return (
+    shouldUpdateScheduleAmountField(schedule, fields, TYPES.schedule.fields.partialPaid, 'partialPaid', 'partialPaidRaw') ||
+    shouldUpdateScheduleAmountField(schedule, fields, TYPES.schedule.fields.remaining, 'remaining', 'remainingRaw')
+  );
+}
+
+function shouldUpdateScheduleAmountField(schedule, fields, field, valueKey, rawKey) {
+  const expected = fields[field];
+
+  if (expected === '') {
+    const rawValue = schedule[rawKey];
+    return rawValue !== undefined && rawValue !== null && String(rawValue).trim() !== '';
+  }
+
+  return Number(schedule[valueKey] ?? 0) !== Number(expected);
 }
 
 export function getDefaultStages() {
@@ -1132,7 +1283,7 @@ export function getDefaultStages() {
   };
 }
 
-async function listDealVouchers(dealId, linkedReceiptIds = []) {
+async function listDealVouchers(dealId, linkedReceiptIds = [], options = {}) {
   const select = [
     'id',
     'stageId',
@@ -1171,8 +1322,10 @@ async function listDealVouchers(dealId, linkedReceiptIds = []) {
   }
 
   const responses = await Promise.all(requests);
+  const excludedReceiptIds = new Set(normalizeIdList(options.excludeReceiptIds));
 
-  return uniqueById(responses.flat().map((voucher) => ({ ...voucher, id: String(voucher.id) })));
+  return uniqueById(responses.flat().map((voucher) => ({ ...voucher, id: String(voucher.id) })))
+    .filter((voucher) => !excludedReceiptIds.has(voucher.id));
 }
 
 function updateSchedule(id, fields) {

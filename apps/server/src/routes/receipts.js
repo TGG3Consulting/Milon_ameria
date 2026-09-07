@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { confirmMatch, importBankTransaction, listBuildingOptions, listReceipts, searchDeals } from '../services/matchEngine.js';
+import { confirmMatch, importBankTransaction, listBuildingOptions, listReceipts, searchDeals, undoMatch } from '../services/matchEngine.js';
 
 export const receiptsRouter = Router();
 
@@ -69,6 +69,24 @@ receiptsRouter.post('/match', async (req, res, next) => {
     res.json({
       ok: true,
       receipt: await confirmMatch(payload)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+receiptsRouter.post('/match/undo', async (req, res, next) => {
+  try {
+    const payload = z
+      .object({
+        receiptId: z.string().regex(/^\d+$/),
+        dealId: z.string().regex(/^\d+$/).optional()
+      })
+      .parse(req.body);
+
+    res.json({
+      ok: true,
+      receipt: await undoMatch(payload)
     });
   } catch (error) {
     next(error);
