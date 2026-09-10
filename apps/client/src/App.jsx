@@ -204,12 +204,15 @@ export default function App() {
   async function handleUndoMatch(receiptId, dealId) {
     const nextReceiptId = receiptId ? String(receiptId) : '';
 
-    setError('');
-
     if (!nextReceiptId || undoingReceiptIds.includes(nextReceiptId) || confirmingReceiptIds.includes(nextReceiptId)) {
       return false;
     }
 
+    if (!window.confirm('\u054e\u057d\u057f\u0561\u055e\u0570 \u0565\u0584, \u0578\u0580 \u0581\u0561\u0576\u056f\u0561\u0576\u0578\u0582\u0574 \u0565\u0584 \u0570\u0565\u057f \u057f\u0561\u0576\u0565\u056c \u0561\u0575\u057d \u0570\u0561\u0574\u0561\u057a\u0561\u057f\u0561\u057d\u056d\u0561\u0576\u0565\u0581\u0578\u0582\u0574\u0568\u0589')) {
+      return false;
+    }
+
+    setError('');
     setUndoingReceiptIds((current) => [...current, nextReceiptId]);
 
     try {
@@ -272,7 +275,8 @@ export default function App() {
       return;
     }
 
-    setReceiptQueueIndex((currentIndex) => (currentIndex < receiptQueue.length ? currentIndex : 0));
+    // Every click on the Smart Match button starts a fresh review from the first receipt.
+    setReceiptQueueIndex(0);
     setSelectedSuggestionId('');
     setSuggestionModalClosed(false);
   }

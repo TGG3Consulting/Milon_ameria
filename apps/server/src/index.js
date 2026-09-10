@@ -3,6 +3,7 @@ import express from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
 import { ameriaRouter } from './routes/ameria.js';
+import { adminRouter } from './routes/admin.js';
 import { bitrixRouter } from './routes/bitrix.js';
 import { healthRouter } from './routes/health.js';
 import { receiptsRouter } from './routes/receipts.js';
@@ -17,6 +18,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use('/api/health', healthRouter);
 app.use('/api/bitrix', bitrixRouter);
 app.use('/api/ameria', ameriaRouter);
+app.use('/api/admin', adminRouter);
 app.use('/api/receipts', receiptsRouter);
 
 app.use((error, _req, res, _next) => {

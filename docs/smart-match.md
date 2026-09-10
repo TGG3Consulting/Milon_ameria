@@ -14,8 +14,8 @@ Set `SMART_MATCH_V2=true` to enable all of the following together:
 - name matching with safe full-name token reordering;
 - conflict vetoes, including an explicit apartment mismatch.
 
-The flag defaults to `false`, so existing deployments keep legacy behaviour until shadow results
-have been reviewed.
+The flag defaults to `false`, so numeric parsing keeps legacy behaviour until shadow results
+have been reviewed. The shared three-project name/address mapping is active in both modes; see [Bitrix mapping](bitrix-mapping.md#project-mapping).
 
 ## Decision ladder
 

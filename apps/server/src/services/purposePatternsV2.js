@@ -1,8 +1,7 @@
 // Additive V2 purpose parser.
 //
-// It does NOT replace parsePurpose()/PURPOSE_PATTERNS in matchEngine.js: both keep working
-// untouched. V2 exists so the known legacy defects can be fixed without changing any current
-// output until the feature flag is switched on.
+// Numeric parsing fixes remain behind the feature flag. Both parsers share the project mapping
+// so Armenian/Russian names and known addresses resolve consistently in either mode.
 //
 // Two hard constraints drive every pattern below:
 //   1. Patterns run against the output of matchEngine's normalize(), which applies NFKC first.
@@ -11,6 +10,8 @@
 //      Every alternative lives in its own regex with its own unique group name.
 
 import { normalize } from './matchEngine.js';
+import { resolveProject } from './projectMapping.js';
+export { PROJECT_PATTERNS as PROJECT_PATTERNS_V2 } from './projectMapping.js';
 
 const LB = '(?<![\\p{L}\\p{N}])';
 const RB = '(?![\\p{L}\\p{N}])';
@@ -86,12 +87,6 @@ export const PURPOSE_PATTERNS_V2 = {
     re(`(?<!\\d)(?<date_iso>\\d{4}-\\d{1,2}-\\d{1,2})(?!\\d)`)
   ]
 };
-
-export const PROJECT_PATTERNS_V2 = [
-  { name: 'Milon Tower', pattern: re(`(?<!\\p{L})(?:milon\\s*tower|միլոն\\s*թաուեր|միլոն\\s*տաուեր)(?!\\p{L})`) },
-  { name: 'Milon Plaza', pattern: re(`(?<!\\p{L})(?:milon\\s*plaza|միլոն\\s*պլազա)(?!\\p{L})`) },
-  { name: 'Milon Hills', pattern: re(`(?<!\\p{L})(?:milon\\s*hills|միլոն\\s*հիլս)(?!\\p{L})`) }
-];
 
 const PROJECT_BUILDING_PATTERNS = [
   re(`(?<!\\d)(?<project_building_before>\\d{1,4})\\s*(?:milon\\s*tower|միլոն\\s*թաուեր|միլոն\\s*տաուեր)${RB}`),
@@ -196,7 +191,7 @@ export function parsePurposeV2(purpose = '') {
     spans.contractDate = { index: dateHit.index, length: dateHit.raw.length };
   }
 
-  const project = PROJECT_PATTERNS_V2.find(({ pattern }) => pattern.test(normalized)) ?? null;
+  const project = resolveProject(normalized);
 
   if (project) {
     matchedBy.project = 'project_dictionary';

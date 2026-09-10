@@ -67,3 +67,25 @@ The app uses Bitrix24 as the main storage and reads all operational data from Bi
 ## Ameriabank Sync
 
 Cron should call `POST /api/ameria/sync`. The server pulls transactions from `AMERIA_TRANSACTIONS_PATH`, creates only missing Bitrix `1056` receipt items, and returns the imported Bitrix items.
+
+Sync is restricted to accounts `1570043109812500`, `1570043109990200`, and `1570043104948500`. Other accounts returned by Ameriabank are ignored. An explicit `accountNumber` must be one of these three accounts; other values are rejected with HTTP 400 before any bank request.
+
+## Project mapping
+
+Deal field `UF_CRM_1778739784729` identifies the three projects. Both purpose parsers use
+`apps/server/src/services/projectMapping.js`; recognition does not require `SMART_MATCH_V2`.
+
+| CRM ID | Canonical project | Armenian name | Russian name | Known address |
+| --- | --- | --- | --- | --- |
+| 1505 | Milon Plaza | Միլոն Պլազա համալիր | Комплекс Милон Плаза | Աբովյան, Օգոստոսի 23 փ., թիվ 5 / Абовян, улица 23 Августа, дом 5 |
+| 1507 | Milon Tower | Միլոն Թաուեր համալիր | Комплекс Милон Тауер | Աբովյան, Բարեկամության հրապարակ, 5/1 / Абовян, площадь Барекамутяна, 5/1 |
+| 1503 | Milon Hills | Միլոն Հիլս թաղամաս | Район Милон Хиллз | Առինջ Բ թաղամաս, 1-ին փ., թիվ 7 / Ариндж, микрорайон Б, 1-я улица, 7 |
+
+Names and these addresses independently identify the same project, including common abbreviations,
+case, spacing and separator variants. Existing English names remain supported. Street and house
+numbers are matched together; a bare `5/1`, `5` or `7` does not identify a project.
+
+Suggestions compare the resolved project with the structured CRM ID, falling back to deal text
+when that ID is unavailable. A project still needs additional evidence for a direct deal suggestion.
+Different known projects or multiple projects in one purpose veto a suggestion, including contact
+suggestions when the same payer has deals in different buildings.

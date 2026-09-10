@@ -2,8 +2,9 @@ import { addActivity, getActivityLog } from './activityStore.js';
 import { callBitrixMethod, listBitrixMethod } from './bitrixClient.js';
 import { env } from '../config/env.js';
 import { parsePurposeV2 } from './purposePatternsV2.js';
-import { canonicalize, canonicalizeNumeric, smartFindValue } from './smartMatch.js';
+import { canonicalizeNumeric, smartFindValue } from './smartMatch.js';
 import { normalizeBankTransaction } from './transactionValidation.js';
+import { BUILDING_OPTIONS, findProjects, getProjectById, resolveProject } from './projectMapping.js';
 
 const TYPES = {
   voucher: {
@@ -24,7 +25,8 @@ const TYPES = {
       credit: 'ufCrm19_1785737256',
       payerDocument: 'ufCrm19_1785737495',
       payerAddress: 'ufCrm19_1785737544',
-      amountWords: 'ufCrm19_1785738501'
+      amountWords: 'ufCrm19_1785738501',
+      bankTransactionId: 'ufCrm19_1789042243'
     }
   },
   schedule: {
@@ -51,6 +53,8 @@ const DEAL_SELECT = [
   'ID',
   'TITLE',
   'CATEGORY_ID',
+  'STAGE_ID',
+  'STAGE_SEMANTIC_ID',
   'CONTACT_ID',
   'OPPORTUNITY',
   'CURRENCY_ID',
@@ -81,11 +85,6 @@ const CURRENCY_ENUM = {
   RUB: 1655,
   EUR: 1657
 };
-const BUILDING_OPTIONS = [
-  { label: 'Milon Tower', value: '1507' },
-  { label: 'Milon Plaza', value: '1505' },
-  { label: 'Milon Hills', value: '1503' }
-];
 const STATUS_ENTITY_IDS = {
   voucher: 'DYNAMIC_1056_35',
   schedule: 'DYNAMIC_1052_STAGE_33'
@@ -143,12 +142,6 @@ const PURPOSE_PATTERNS = {
   ]
 };
 
-const PROJECT_PATTERNS = [
-  { name: 'Milon Tower', pattern: /(?<!\p{L})(?:milon\s*tower|միլոն\s*թաուեր|միլոն\s*տաուեր)(?!\p{L})/iu },
-  { name: 'Milon Plaza', pattern: /(?<!\p{L})(?:milon\s*plaza|միլոն\s*պլազա)(?!\p{L})/iu },
-  { name: 'Milon Hills', pattern: /(?<!\p{L})(?:milon\s*hills|միլոն\s*հիլս)(?!\p{L})/iu }
-];
-
 export function resetStageCache() {
   stagesPromise = null;
 }
@@ -192,7 +185,7 @@ export function parsePurpose(purpose = '') {
   const normalized = normalize(purpose);
   const contractDate = matchFirst(normalized, PURPOSE_PATTERNS.contractDate);
   const withoutDates = maskMatches(normalized, PURPOSE_PATTERNS.contractDate);
-  const project = PROJECT_PATTERNS.find(({ pattern }) => pattern.test(normalized)) ?? null;
+  const project = resolveProject(normalized);
   const projectBuilding = matchFirst(normalized, [
     /(?<!\d)(\d{1,4})\s*(?:milon\s*tower|միլոն\s*թաուեր|միլոն\s*տաուեր)(?![\p{L}\p{N}])/iu,
     /(?<![\p{L}\p{N}])(?:milon\s*tower|միլոն\s*թաուեր|միլոն\s*տաուեր)\s*(?:շենք|building|bldg?\.?)?\s*(?:թիվ|№|#|n(?:o)?\.?)?\s*(\d{1,4})(?!\d)/iu
@@ -293,6 +286,10 @@ async function createBankReceiptOnce(transaction) {
   const receipt = result.item ?? result;
   await addActivity({
     receiptId: result.item?.id ?? result.item?.ID ?? 'new',
+    bankTransactionId: transaction.transactionId,
+    receiptTitle: receipt.title ?? null,
+    amount: transaction.amount,
+    currency: transaction.currency,
     action: 'Bank receipt was created in Bitrix',
     actor: 'System'
   });
@@ -546,6 +543,7 @@ async function listBitrixVouchers() {
       'id',
       'title',
       'xmlId',
+       TYPES.voucher.fields.bankTransactionId,
       'stageId',
       'parentId2',
       'opportunity',
@@ -594,7 +592,7 @@ function mapVoucherData(item, stages) {
   const purpose = item[TYPES.voucher.fields.purpose] ?? '';
   return {
     id: String(item.id),
-    bankTransactionId: item.xmlId || String(item.id),
+    bankTransactionId: item[TYPES.voucher.fields.bankTransactionId] || item.xmlId || String(item.id),
     bitrixTitle: item.title,
     amount,
     currency: item.currencyId || 'AMD',
@@ -633,7 +631,8 @@ function mapSchedule(item) {
 
 function getSuggestions(receipt, schedules, context) {
   const documentPrefix = getDocumentPrefix(receipt.payerDocument);
-  const contactDeals = context.contactDealsByDocument.get(documentPrefix) ?? [];
+  const contactDeals = (context.contactDealsByDocument.get(documentPrefix) ?? [])
+    .filter((deal) => !getProjectDealEvidence(receipt, deal).conflict);
   const contactDealIds = new Set(contactDeals.map((deal) => deal.id));
 
   const contactSuggestions = contactDeals.map((deal) => {
@@ -710,11 +709,9 @@ function buildSuggestionDeal(deal, schedules = [], receipts = [], stages = getDe
 
 function getAllDealSchedules(deal, schedules) {
   const linkedScheduleIds = new Set(deal.scheduleIds ?? []);
-  const byDealField = schedules.filter((schedule) => linkedScheduleIds.has(schedule.id));
-  const fallbackByParent = schedules.filter((schedule) => schedule.dealId === deal.id);
-  const dealSchedules = byDealField.length ? byDealField : fallbackByParent;
-
-  return dealSchedules.sort((left, right) => Number(left.id) - Number(right.id));
+  return schedules
+    .filter((schedule) => linkedScheduleIds.has(schedule.id))
+    .sort((left, right) => Number(left.id) - Number(right.id));
 }
 
 function buildPaymentTimeline(receipts, schedules, stages) {
@@ -877,7 +874,16 @@ async function listRecentDeals() {
     order: { ID: 'DESC' }
   });
 
-  return response.map(mapDeal);
+  return response.filter(isEligibleDealForMatching).map(mapDeal);
+}
+
+export function isEligibleDealForMatching(deal) {
+  const stageId = String(deal?.STAGE_ID ?? '').toUpperCase();
+  const stageSemanticId = String(deal?.STAGE_SEMANTIC_ID ?? '').toUpperCase();
+
+  // Bitrix marks rejected/lost deals with failure semantics. They must never become
+  // payment suggestions, even when apartment, name, or contact data matches.
+  return stageSemanticId !== 'F' && stageId !== 'C5:LOSE';
 }
 
 function mapDeal(deal) {
@@ -894,6 +900,8 @@ function mapDeal(deal) {
     id: String(deal.ID),
     bitrixUrl: getBitrixDealUrl(deal.ID),
     title,
+    stageId: String(deal.STAGE_ID ?? ''),
+    stageSemanticId: String(deal.STAGE_SEMANTIC_ID ?? ''),
     buyerName,
     address: title,
     amount: Number(deal.OPPORTUNITY ?? 0),
@@ -926,6 +934,7 @@ function mapBankTransactionToVoucherFields(transaction, stages) {
   return {
     title: transaction.title ?? `Bank receipt ${transaction.transactionId ?? ''}`.trim(),
     xmlId: transaction.transactionId ? String(transaction.transactionId) : undefined,
+    [TYPES.voucher.fields.bankTransactionId]: transaction.transactionId ? String(transaction.transactionId) : '',
     categoryId: TYPES.voucher.categoryId,
     stageId: stages.voucher.new,
     opportunity: amount,
@@ -1092,15 +1101,15 @@ async function recalculateDealSchedules(deal, stages, linkedReceiptIds = [], opt
 }
 
 async function listDealSchedulesForRecalculation(deal) {
-  const dealId = String(deal?.ID ?? deal?.id ?? '');
   const scheduleIds = normalizeIdList(deal?.[DEAL_FIELDS.scheduleIds] ?? deal?.scheduleIds);
-  const filter = scheduleIds.length
-    ? { categoryId: TYPES.schedule.categoryId, '@id': scheduleIds }
-    : { categoryId: TYPES.schedule.categoryId, parentId2: dealId };
+  if (!scheduleIds.length) {
+    return [];
+  }
+
   const items = await listBitrixMethod('crm.item.list', {
     entityTypeId: TYPES.schedule.entityTypeId,
     order: { id: 'ASC' },
-    filter,
+    filter: { categoryId: TYPES.schedule.categoryId, '@id': scheduleIds },
     select: [
       'id',
       'stageId',
@@ -1414,8 +1423,9 @@ function isPayableSchedule(schedule, stages) {
 
 export function dealMatchesReceipt(receipt, deal) {
   const parsed = receipt.parsed ?? {};
+  const projectEvidence = getProjectDealEvidence(receipt, deal);
 
-  if (hasApartmentConflict(parsed.apartment, deal)) {
+  if (hasApartmentConflict(parsed.apartment, deal) || projectEvidence.conflict) {
     return false;
   }
 
@@ -1432,7 +1442,7 @@ export function dealMatchesReceipt(receipt, deal) {
   const apartmentMatches = apartmentMatchesDeal(parsed.apartment, deal);
   const preliminaryMatches = parsed.preliminaryNumber ? numberTokens.has(normalizeNumber(parsed.preliminaryNumber)) : false;
   const areaMatches = parsed.area ? numberTokens.has(normalizeNumber(parsed.area)) : false;
-  const projectMatches = parsed.project ? includesText(haystack, parsed.project) : false;
+  const projectMatches = projectEvidence.matched;
   const contractMatches = parsed.contractDate ? includesText(haystack, parsed.contractDate) : false;
   const payerMatches = receipt.payerName ? namesOverlap(receipt.payerName, deal.buyerName) : false;
 
@@ -1450,7 +1460,7 @@ function getDirectDealScore(receipt, deal) {
   const numberTokens = getNumberTokens(haystack);
   let score = 70;
 
-  if (parsed.project && includesText(haystack, parsed.project)) {
+  if (getProjectDealEvidence(receipt, deal).matched) {
     score += 10;
   }
 
@@ -1501,9 +1511,29 @@ function hasApartmentConflict(parsedApartment, deal) {
   );
 }
 
+function getProjectDealEvidence(receipt, deal) {
+  // The CRM enum is authoritative; labels and addresses support older deals without it.
+  const structuredProject = getProjectById(deal.projectId);
+  const dealProjects = structuredProject ? [structuredProject] : findProjects(
+    [deal.projectName, deal.title, deal.searchableText].filter(Boolean).join(' ')
+  );
+  const receiptProjects = findProjects(
+    [receipt.parsed?.project, receipt.purpose ?? receipt.parsed?.normalized].filter(Boolean).join(' ')
+  );
+  const differentProjects = receiptProjects.length === 1 && dealProjects.length === 1 &&
+    receiptProjects[0].id !== dealProjects[0].id;
+  const conflict = receiptProjects.length > 1 || dealProjects.length > 1 || differentProjects;
+
+  return {
+    matched: !conflict && receiptProjects.length === 1 && dealProjects.length === 1,
+    conflict,
+    label: dealProjects.length === 1 ? dealProjects[0].name : ''
+  };
+}
+
 export function getSmartDealEvidence(receipt, deal) {
   const purpose = receipt.purpose ?? '';
-  const projectLabel = BUILDING_OPTIONS.find((option) => option.value === deal.projectId)?.label ?? '';
+  const projectEvidence = getProjectDealEvidence(receipt, deal);
   const find = (target, kind, minConfidence = 0) => target
     ? smartFindValue(purpose, target, {
       kind,
@@ -1512,7 +1542,7 @@ export function getSmartDealEvidence(receipt, deal) {
       requireSemanticAnchor: true
     })
     : null;
-  const project = find(projectLabel, 'project', 0.7);
+  const project = projectEvidence.matched || find(projectEvidence.label, 'project', 0.7);
   const apartment = find(deal.apartmentNumber, 'apartment', 0.8);
   const floor = find(deal.floor, 'floor', 0.8);
   const area = find(deal.area, 'area', 0.8);
@@ -1523,18 +1553,12 @@ export function getSmartDealEvidence(receipt, deal) {
     ? namesOverlap(receipt.payerName, deal.buyerName)
     : false;
   const parsedApartment = receipt.parsed?.apartment;
-  const parsedProject = receipt.parsed?.project;
   const apartmentConflict = Boolean(
     parsedApartment &&
     deal.apartmentNumber &&
     canonicalizeNumeric(parsedApartment) !== canonicalizeNumeric(deal.apartmentNumber)
   );
-  const projectConflict = Boolean(
-    parsedProject &&
-    projectLabel &&
-    canonicalize(parsedProject) !== canonicalize(projectLabel)
-  );
-  const conflict = apartmentConflict || projectConflict;
+  const conflict = apartmentConflict || projectEvidence.conflict;
 
   const matched = Boolean(
     !conflict && (
