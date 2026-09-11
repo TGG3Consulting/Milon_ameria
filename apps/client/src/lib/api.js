@@ -14,7 +14,8 @@ export async function getReceipts() {
   const response = await fetch(`${API_BASE_URL}/api/receipts`);
 
   if (!response.ok) {
-    throw new Error('Receipts load failed');
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Receipts load failed (${response.status})`);
   }
 
   return response.json();

@@ -100,6 +100,7 @@ const CONTACT_MATCH_SCORE = 110;
 const receiptImportLocks = new Map();
 const matchLocks = new Map();
 let stagesPromise = null;
+let receiptBoardLoadPromise = null;
 
 // Payment purposes arrive from several banks and are commonly typed with compact Armenian,
 // Russian, English, and transliterated abbreviations. Keep every field independent so forms
@@ -215,7 +216,16 @@ export function parsePurpose(purpose = '') {
   };
 }
 
-export async function listReceipts() {
+export function listReceipts() {
+  if (receiptBoardLoadPromise) return receiptBoardLoadPromise;
+
+  receiptBoardLoadPromise = loadReceipts().finally(() => {
+    receiptBoardLoadPromise = null;
+  });
+  return receiptBoardLoadPromise;
+}
+
+async function loadReceipts() {
   const [stages, voucherResponse] = await Promise.all([getStages(), listBitrixVouchers()]);
 
   if (!voucherResponse.items.length) {

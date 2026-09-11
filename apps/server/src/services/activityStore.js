@@ -13,10 +13,13 @@ async function ensureLoaded() {
 
   try {
     const content = await readFile(logPath, 'utf8');
-    const parsed = JSON.parse(content);
+    const parsed = content.trim() ? JSON.parse(content) : [];
     entries = Array.isArray(parsed) ? parsed : [];
   } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+    if (error instanceof SyntaxError) {
+      console.error(`Ignoring invalid activity log at ${logPath}:`, error.message);
+    }
   }
 
   loaded = true;
@@ -90,7 +93,13 @@ export async function addActivity(entry) {
   entries.unshift(nextEntry);
   entries = entries.slice(0, 1000);
   writeQueue = writeQueue.then(persist, persist);
-  await writeQueue;
+  try {
+    await writeQueue;
+  } catch (error) {
+    // The activity log is auxiliary. Its filesystem failure must not roll back a
+    // Bitrix operation that already completed successfully.
+    console.error('Could not persist activity log:', error.message);
+  }
 
   try {
     await persistToDatabase(nextEntry);
