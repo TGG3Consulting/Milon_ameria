@@ -1,5 +1,5 @@
 import { addActivity, getActivityLog } from './activityStore.js';
-import { callBitrixMethod, listBitrixMethod } from './bitrixClient.js';
+import { callBitrixMethod, listBitrixMethod, listBitrixDealsById } from './bitrixClient.js';
 import { env } from '../config/env.js';
 import { parsePurposeV2 } from './purposePatternsV2.js';
 import { canonicalizeNumeric, smartFindValue } from './smartMatch.js';
@@ -97,10 +97,15 @@ const DOCUMENT_PREFIX_LENGTH = 9;
 const MIN_DOCUMENT_PREFIX_LENGTH = 6;
 const MAX_CONTACT_LOOKUPS = 25;
 const CONTACT_MATCH_SCORE = 110;
+const RECENT_DEALS_CACHE_TTL_MS = 30000;
+const RECENT_DEALS_STALE_TTL_MS = 300000;
 const receiptImportLocks = new Map();
 const matchLocks = new Map();
 let stagesPromise = null;
 let receiptBoardLoadPromise = null;
+let recentDealsPromise = null;
+let recentDealsCache = null;
+let recentDealsGeneration = 0;
 
 // Payment purposes arrive from several banks and are commonly typed with compact Armenian,
 // Russian, English, and transliterated abbreviations. Keep every field independent so forms
@@ -145,6 +150,9 @@ const PURPOSE_PATTERNS = {
 
 export function resetStageCache() {
   stagesPromise = null;
+  recentDealsPromise = null;
+  recentDealsCache = null;
+  recentDealsGeneration += 1;
 }
 
 async function getStages() {
@@ -370,6 +378,7 @@ export async function undoMatch(payload) {
 }
 
 async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
+  invalidateRecentDealsCache();
   const [stages, deal, receipt] = await Promise.all([
     getStages(),
     getBitrixDeal(dealId),
@@ -391,7 +400,7 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
   }
 
   assertMatchEntities({ deal, receipt, dealId, stages });
-  await validateSelectedSchedules(scheduleIds, dealId, stages);
+  validateSelectedSchedules(scheduleIds, deal);
 
   const contactId = getDealContactId(deal);
   const previousReceiptIds = deal?.[DEAL_FIELDS.receiptIds] ?? [];
@@ -423,6 +432,7 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
       action: `Receipt matched with Deal #${dealId}; schedules recalculated`,
       actor: 'Manager'
     });
+    invalidateRecentDealsCache();
 
     return {
       id: receiptId,
@@ -458,6 +468,7 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
 }
 
 async function undoMatchOnce({ receiptId, dealId: requestedDealId }) {
+  invalidateRecentDealsCache();
   const [stages, receipt] = await Promise.all([
     getStages(),
     getBitrixVoucher(receiptId)
@@ -878,13 +889,48 @@ function uniqueById(items) {
 }
 
 async function listRecentDeals() {
-  const response = await listBitrixMethod('crm.deal.list', {
+  const now = Date.now();
+  if (recentDealsCache && recentDealsCache.expiresAt > now) {
+    return recentDealsCache.deals;
+  }
+  if (recentDealsPromise) return recentDealsPromise;
+
+  const generation = recentDealsGeneration;
+  const currentPromise = listBitrixDealsById({
     filter: { CATEGORY_ID: 5 },
     select: DEAL_SELECT,
     order: { ID: 'DESC' }
-  });
+  })
+    .then((response) => {
+      const deals = response.filter(isEligibleDealForMatching).map(mapDeal);
+      if (generation === recentDealsGeneration) {
+        recentDealsCache = {
+          deals,
+          expiresAt: Date.now() + RECENT_DEALS_CACHE_TTL_MS,
+          staleUntil: Date.now() + RECENT_DEALS_STALE_TTL_MS
+        };
+      }
+      return deals;
+    })
+    .catch((error) => {
+      if (recentDealsCache?.staleUntil > Date.now()) {
+        console.warn(`Using cached Bitrix deals after refresh failed: ${error.message}`);
+        return recentDealsCache.deals;
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (recentDealsPromise === currentPromise) recentDealsPromise = null;
+    });
 
-  return response.filter(isEligibleDealForMatching).map(mapDeal);
+  recentDealsPromise = currentPromise;
+  return currentPromise;
+}
+
+function invalidateRecentDealsCache() {
+  recentDealsGeneration += 1;
+  recentDealsPromise = null;
+  recentDealsCache = null;
 }
 
 export function isEligibleDealForMatching(deal) {
@@ -1002,25 +1048,14 @@ function assertUndoEntities({ receipt, receiptId, dealId, linkedDealId, stages }
   }
 }
 
-async function validateSelectedSchedules(scheduleIds, dealId, stages) {
+function validateSelectedSchedules(scheduleIds, deal) {
   const uniqueIds = [...new Set(scheduleIds.map(String))];
   if (!uniqueIds.length) return;
-
-  const schedules = await listBitrixMethod('crm.item.list', {
-    entityTypeId: TYPES.schedule.entityTypeId,
-    filter: { '@id': uniqueIds },
-    select: ['id', 'categoryId', 'parentId2', 'stageId']
-  });
-  const byId = new Map(schedules.map((schedule) => [String(schedule.id), schedule]));
+  const linkedIds = new Set(normalizeIdList(deal?.[DEAL_FIELDS.scheduleIds]));
 
   for (const scheduleId of uniqueIds) {
-    const schedule = byId.get(scheduleId);
-    if (!schedule) throw requestError(`Payment schedule #${scheduleId} was not found`);
-    if (Number(schedule.categoryId) !== TYPES.schedule.categoryId || String(schedule.parentId2 ?? '') !== String(dealId)) {
-      throw requestError(`Payment schedule #${scheduleId} does not belong to the selected deal/category`);
-    }
-    if (![stages.schedule.unpaid, stages.schedule.partial].includes(schedule.stageId)) {
-      throw requestError(`Payment schedule #${scheduleId} is not payable`, 409);
+    if (!linkedIds.has(scheduleId)) {
+      throw requestError(`Payment schedule #${scheduleId} does not belong to the selected deal`);
     }
   }
 }
@@ -1081,9 +1116,17 @@ async function recalculateDealSchedules(deal, stages, linkedReceiptIds = [], opt
   const updates = planScheduleUpdates(schedules, amdTotal, stages);
   const completed = [];
   try {
-    for (const update of updates) {
-      await updateSchedule(update.schedule.id, update.fields);
-      completed.push(update.schedule);
+    const results = await Promise.allSettled(
+      updates.map((update) => updateSchedule(update.schedule.id, update.fields))
+    );
+    for (let index = 0; index < results.length; index += 1) {
+      if (results[index].status === 'fulfilled') {
+        completed.push(updates[index].schedule);
+      }
+    }
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed) {
+      throw failed.reason;
     }
 
     await updateDealScheduleSummary(dealId, schedules, amdTotal);

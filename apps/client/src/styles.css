@@ -958,6 +958,13 @@ a.bitrix-link-button {
   overflow-wrap: anywhere;
 }
 
+.receipt-payment-date {
+  color: #0f6d8c;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
 .receipt-card small {
   color: #566477;
   font-size: 12px;
@@ -1036,6 +1043,13 @@ a.bitrix-link-button {
   font-size: 12px;
   line-height: 1.35;
   margin: 0;
+}
+
+.receipt-summary > .receipt-payment-date,
+.modal-receipt > .receipt-payment-date {
+  color: #0f6d8c;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .badges {

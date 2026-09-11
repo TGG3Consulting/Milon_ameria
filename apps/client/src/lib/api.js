@@ -48,7 +48,7 @@ export async function confirmMatch(payload, options = {}) {
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error ?? 'Match confirmation failed');
+    throw new Error(data.error ?? `Match confirmation failed (${response.status})`);
   }
 
   return response.json();

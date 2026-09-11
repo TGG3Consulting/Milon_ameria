@@ -581,6 +581,7 @@ function SuggestionModal({
           </div>
           <strong>{formatMoney(receipt.amount, receipt.currency)}</strong>
           <span>{receipt.payerName}</span>
+          <ReceiptPaymentDate receipt={receipt} />
           <p>{receipt.purpose}</p>
           <ParsedBadges parsed={receipt.parsed} />
         </div>
@@ -867,6 +868,7 @@ function Column({
               <span>{formatMoney(receipt.amount, receipt.currency)}</span>
             </div>
             <p>{receipt.payerName}</p>
+            <ReceiptPaymentDate receipt={receipt} />
             <small>{receipt.purpose}</small>
           </button>
         ))}
@@ -1121,6 +1123,20 @@ function getReceiptDate(receipt) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function ReceiptPaymentDate({ receipt }) {
+  const date = getReceiptDate(receipt);
+
+  if (!date) {
+    return null;
+  }
+
+  return (
+    <span className="receipt-payment-date">
+      {'\u054e\u0573\u0561\u0580\u0574\u0561\u0576 \u0561\u0574\u057d\u0561\u0569\u056b\u057e'} {formatDate(date)}
+    </span>
+  );
+}
+
 function ManualSearchModal({ deals, filters, loading, confirming, selectedDeal, onClose, onConfirm, onSearch, onSelectDeal }) {
   return (
     <div className="suggestion-modal-backdrop" role="presentation">
@@ -1237,6 +1253,7 @@ function ReceiptSidebar({
         <div className="receipt-summary">
           <strong>{formatMoney(receipt.amount, receipt.currency)}</strong>
           <span>{receipt.payerName}</span>
+          <ReceiptPaymentDate receipt={receipt} />
           <p>{receipt.purpose}</p>
           <ParsedBadges parsed={receipt.parsed} />
         </div>

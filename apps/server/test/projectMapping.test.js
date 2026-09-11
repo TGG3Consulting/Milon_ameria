@@ -174,16 +174,17 @@ test('receipt suggestions apply project mapping to direct and contact matches wi
       calls.push(method);
       let result;
       if (method === 'crm.item.list.json') {
-        result = { items: params.entityTypeId === 1056 ? ['', 'AB1234567'].map((document, index) => ({
+        const items = params.entityTypeId === 1056 ? ['', 'AB1234567'].map((document, index) => ({
           id: index + 1, stageId: 'DT1056_35:NEW',
           ufCrm19_1785738531: 'Котайкская область, г. Абовян, площадь Барекамутяна, 5/1, квартира 55',
           ufCrm19_1785737495: document
-        })) : [] };
+        })) : [];
+        result = { items: params.order?.id === 'DESC' ? items.reverse() : items };
       } else if (method === 'crm.deal.list.json') {
         result = projects.map(({ id }, index) => ({
           ID: index + 1, TITLE: 'Buyer contract', CONTACT_ID: '10',
           UF_CRM_1778739784729: id, UF_CRM_65BE4878488D4: '55'
-        }));
+        })).reverse();
       } else if (method === 'crm.contact.list.json') {
         result = [{ ID: '10', UF_CRM_1688399117351: 'AB1234567' }];
       } else {
@@ -201,10 +202,13 @@ test('receipt suggestions apply project mapping to direct and contact matches wi
         assert.equal(receipt.parsed.project, 'Milon Tower');
         assert.deepEqual(receipt.suggestions.map(({ deal }) => deal.projectId), ['1507']);
       }
-      assert.equal(unmatched[0].suggestions[0].label, 'Deal Match');
-      assert.equal(unmatched[1].suggestions[0].label, 'Contact Match');
+      const directReceipt = unmatched.find((receipt) => !receipt.payerDocument);
+      const contactReceipt = unmatched.find((receipt) => receipt.payerDocument);
+      assert.equal(directReceipt.suggestions[0].label, 'Deal Match');
+      assert.equal(contactReceipt.suggestions[0].label, 'Contact Match');
     }
     assert.ok(calls.every((method) => method.endsWith('.list.json')));
+    assert.equal(calls.filter((method) => method === 'crm.deal.list.json').length, 1);
   } finally {
     Object.assign(env, previous);
     resetStageCache();

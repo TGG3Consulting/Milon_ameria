@@ -1,5 +1,18 @@
 import axios from 'axios';
+import { Agent } from 'node:https';
+import { setTimeout as delay } from 'node:timers/promises';
 import { env } from '../config/env.js';
+
+const BITRIX_MAX_CONCURRENT_REQUESTS = 2;
+const sharedWebhookAgent = new Agent({
+  family: 4,
+  keepAlive: true,
+  maxSockets: BITRIX_MAX_CONCURRENT_REQUESTS,
+  maxFreeSockets: BITRIX_MAX_CONCURRENT_REQUESTS
+});
+const priorityQueue = [];
+const regularQueue = [];
+let activeRequests = 0;
 
 export function createBitrixClient(domain, accessToken) {
   return axios.create({
@@ -50,7 +63,8 @@ export function createBitrixWebhookClient() {
 
   return axios.create({
     baseURL: env.BITRIX_WEBHOOK_URL,
-    timeout: env.BITRIX_REQUEST_TIMEOUT_MS
+    timeout: env.BITRIX_REQUEST_TIMEOUT_MS,
+    httpsAgent: sharedWebhookAgent
   });
 }
 
@@ -68,26 +82,66 @@ export async function callBitrixMethodResponse(method, params = {}) {
   }
 
   let data;
+  const readOnly = /^crm\.[a-z]+\.(?:list|get)$/u.test(method);
+  const attempts = readOnly ? 3 : 1;
+  const timeout = readOnly ? Math.min(env.BITRIX_REQUEST_TIMEOUT_MS, 20000) : env.BITRIX_REQUEST_TIMEOUT_MS;
+  const priority = method.endsWith('.get') || !readOnly ? 'high' : 'regular';
+  const started = Date.now();
 
-  try {
-    ({ data } = await client.post(`${method}.json`, params));
-  } catch (error) {
-    const code = String(error.code ?? '');
-    const isTimeout = code === 'ECONNABORTED' || code === 'ETIMEDOUT' || /timed?\s*out/iu.test(error.message);
-
-    if (isTimeout) {
-      const timeoutError = new Error(
-        `Bitrix ${method} request timed out after ${env.BITRIX_REQUEST_TIMEOUT_MS}ms`
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // Retrying a read uses a fresh socket instead of a potentially broken pooled one.
+    const retryAgent = attempt > 1 ? new Agent({ family: 4, keepAlive: false }) : null;
+    try {
+      let response;
+      let requestStarted;
+      response = await scheduleBitrixRequest(
+        () => {
+          requestStarted = Date.now();
+          return client.post(`${method}.json`, params, {
+            timeout,
+            ...(retryAgent ? { httpsAgent: retryAgent } : {})
+          });
+        },
+        priority
       );
-      timeoutError.status = 504;
-      timeoutError.cause = error;
-      throw timeoutError;
-    }
+      ({ data } = response);
+      const duration = Date.now() - requestStarted;
+      if (duration >= 5000) {
+        console.warn(`Bitrix ${method} slow response: ${duration}ms (edge ${getRemoteAddress(response)})`);
+      }
+      break;
+    } catch (error) {
+      const code = String(error.code ?? '');
+      const isTimeout = ['ECONNABORTED', 'ETIMEDOUT', 'ERR_CANCELED'].includes(code);
+      const transient = isTimeout || ['ECONNRESET', 'EPIPE', 'EAI_AGAIN'].includes(code)
+        || [502, 503, 504].includes(error.response?.status);
 
-    const requestError = new Error(`Bitrix ${method} request failed: ${error.message}`);
-    requestError.status = error.response?.status ?? 502;
-    requestError.cause = error;
-    throw requestError;
+      if (readOnly && transient && attempt < attempts) {
+        console.warn(
+          `Bitrix ${method} read attempt ${attempt} failed ` +
+          `(${code || error.response?.status}, edge ${getRemoteAddress(error.response, error)}); retrying`
+        );
+        retryAgent?.destroy();
+        await delay(attempt * 500);
+        continue;
+      }
+
+      if (isTimeout) {
+        const timeoutError = new Error(
+          `Bitrix ${method} timed out after ${Date.now() - started}ms (${attempt} attempt(s))`
+        );
+        timeoutError.status = 504;
+        timeoutError.cause = error;
+        throw timeoutError;
+      }
+
+      const requestError = new Error(`Bitrix ${method} request failed: ${error.message}`);
+      requestError.status = error.response?.status ?? 502;
+      requestError.cause = error;
+      throw requestError;
+    } finally {
+      retryAgent?.destroy();
+    }
   }
 
   if (!data || typeof data !== 'object') {
@@ -108,6 +162,13 @@ export async function callBitrixMethod(method, params = {}) {
 }
 
 export async function listBitrixMethod(method, params = {}, selectItems = defaultSelectItems) {
+  if (method === 'crm.item.list' && supportsIdCursor(params.order, 'id')) {
+    return listBitrixMethodById(method, params, selectItems, 'id');
+  }
+  if (method === 'crm.contact.list' && supportsIdCursor(params.order, 'ID')) {
+    return listBitrixMethodById(method, params, selectItems, 'ID');
+  }
+
   const items = [];
   let start = 0;
 
@@ -128,6 +189,105 @@ export async function listBitrixMethod(method, params = {}, selectItems = defaul
   }
 
   throw new Error(`Bitrix pagination limit exceeded for ${method}`);
+}
+
+async function listBitrixMethodById(method, params, selectItems, idField) {
+  const items = [];
+  const requestedDirection = Object.entries(params.order ?? {})
+    .find(([field]) => field.toLowerCase() === idField.toLowerCase())?.[1];
+  const direction = String(requestedDirection ?? 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+  let lastId = direction === 'DESC' ? Infinity : 0;
+  const cursorField = `${direction === 'DESC' ? '<' : '>'}${idField}`;
+
+  for (let page = 0; page < 200; page += 1) {
+    const response = await callBitrixMethodResponse(method, {
+      ...params,
+      filter: {
+        ...params.filter,
+        ...(direction === 'DESC' && !Number.isFinite(lastId) ? {} : { [cursorField]: lastId })
+      },
+      order: { [idField]: direction },
+      start: -1
+    });
+    const pageItems = selectItems(response.result);
+
+    for (const item of pageItems) {
+      const id = Number(item?.[idField]);
+      const validOrder = direction === 'DESC' ? id < lastId : id > lastId;
+      if (!Number.isSafeInteger(id) || id <= 0 || !validOrder) {
+        throw new Error(`Invalid Bitrix ID pagination order for ${method}`);
+      }
+      lastId = id;
+      items.push(item);
+    }
+
+    if (pageItems.length < 50) return items;
+    await delay(500);
+  }
+
+  throw new Error(`Bitrix ID pagination limit exceeded for ${method}`);
+}
+
+function supportsIdCursor(order, idField) {
+  const fields = Object.keys(order ?? {});
+  return fields.length === 0 || (fields.length === 1 && fields[0].toLowerCase() === idField.toLowerCase());
+}
+
+function scheduleBitrixRequest(task, priority) {
+  return new Promise((resolve, reject) => {
+    const queue = priority === 'high' ? priorityQueue : regularQueue;
+    queue.push({ task, resolve, reject });
+    drainBitrixQueue();
+  });
+}
+
+function drainBitrixQueue() {
+  while (activeRequests < BITRIX_MAX_CONCURRENT_REQUESTS) {
+    const next = priorityQueue.shift() ?? regularQueue.shift();
+    if (!next) return;
+
+    activeRequests += 1;
+    Promise.resolve()
+      .then(next.task)
+      .then(next.resolve, next.reject)
+      .finally(() => {
+        activeRequests -= 1;
+        drainBitrixQueue();
+      });
+  }
+}
+
+function getRemoteAddress(response, error) {
+  return response?.request?.socket?.remoteAddress
+    ?? error?.request?.socket?.remoteAddress
+    ?? 'unknown';
+}
+
+// Keep the previous newest-first ordering and all selected fields, but avoid
+// recalculating total/offset on every page. Never return a partial result on failure.
+export async function listBitrixDealsById(params = {}) {
+  const items = [];
+  let lastId = Infinity;
+  for (let page = 0; page < 200; page += 1) {
+    const response = await callBitrixMethodResponse('crm.deal.list', {
+      ...params,
+      filter: { ...params.filter, ...(Number.isFinite(lastId) ? { '<ID': lastId } : {}) },
+      order: { ID: 'DESC' },
+      start: -1
+    });
+    if (!Array.isArray(response.result)) throw new Error('Invalid Bitrix deal list response');
+    for (const item of response.result) {
+      const id = Number(item.ID);
+      if (!Number.isSafeInteger(id) || id <= 0 || id >= lastId) {
+        throw new Error('Invalid Bitrix deal ID pagination order');
+      }
+      lastId = id;
+      items.push(item);
+    }
+    if (response.result.length < 50) return items;
+    await delay(500);
+  }
+  throw new Error('Bitrix deal pagination limit exceeded');
 }
 
 function defaultSelectItems(result) {
