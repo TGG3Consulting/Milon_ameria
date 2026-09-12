@@ -1,7 +1,7 @@
 import { API_BASE_URL } from './apiBase.js';
 
 export async function getHealth() {
-  const response = await fetch(`${API_BASE_URL}/api/health`);
+  const response = await fetch(`${API_BASE_URL}/api/health`, { credentials: 'include' });
 
   if (!response.ok) {
     throw new Error('Health check failed');
@@ -11,7 +11,7 @@ export async function getHealth() {
 }
 
 export async function getReceipts() {
-  const response = await fetch(`${API_BASE_URL}/api/receipts`);
+  const response = await fetch(`${API_BASE_URL}/api/receipts`, { credentials: 'include' });
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -26,6 +26,7 @@ export async function searchDeals(params, options = {}) {
     Object.entries(params).filter(([, value]) => String(value ?? '').trim())
   );
   const response = await fetch(`${API_BASE_URL}/api/receipts/deals/search?${search}`, {
+    credentials: 'include',
     signal: options.signal
   });
 
@@ -39,6 +40,7 @@ export async function searchDeals(params, options = {}) {
 export async function confirmMatch(payload, options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/receipts/match`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json'
     },
@@ -57,6 +59,7 @@ export async function confirmMatch(payload, options = {}) {
 export async function undoMatch(payload, options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/receipts/match/undo`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json'
     },

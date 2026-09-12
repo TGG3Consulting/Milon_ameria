@@ -7,13 +7,14 @@ import { adminRouter } from './routes/admin.js';
 import { bitrixRouter } from './routes/bitrix.js';
 import { healthRouter } from './routes/health.js';
 import { receiptsRouter } from './routes/receipts.js';
-import { startAmeriaScheduler } from './services/syncService.js';
+import { restoreAmeriaScheduler } from './services/syncService.js';
 
 const app = express();
 
 app.use(helmet());
 app.use(cors({ origin: env.CLIENT_ORIGIN }));
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 app.use('/api/health', healthRouter);
 app.use('/api/bitrix', bitrixRouter);
@@ -30,7 +31,11 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-app.listen(env.SERVER_PORT, () => {
+app.listen(env.SERVER_PORT, async () => {
   console.log(`Server listening on http://localhost:${env.SERVER_PORT}`);
-  startAmeriaScheduler();
+  try {
+    await restoreAmeriaScheduler();
+  } catch (error) {
+    console.error('Could not restore Ameria scheduler:', error.message);
+  }
 });

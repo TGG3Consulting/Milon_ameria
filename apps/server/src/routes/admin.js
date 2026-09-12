@@ -34,21 +34,33 @@ adminRouter.post('/sync', async (req, res, next) => {
     next(error);
   }
 });
-adminRouter.get('/scheduler', (_req, res) => {
-  res.json(getAmeriaSchedulerStatus());
-});
-
-adminRouter.post('/scheduler/start', (req, res, next) => {
+adminRouter.get('/scheduler', async (_req, res, next) => {
   try {
-    const { runImmediately } = z.object({ runImmediately: z.boolean().default(false) }).parse(req.body ?? {});
-    res.json(startAmeriaScheduler({ force: true, runImmediately }));
+    res.json(await getAmeriaSchedulerStatus());
   } catch (error) {
     next(error);
   }
 });
 
-adminRouter.post('/scheduler/stop', (_req, res) => {
-  res.json(stopAmeriaScheduler());
+adminRouter.post('/scheduler/start', async (req, res, next) => {
+  try {
+    const params = z.object({
+      runImmediately: z.boolean().default(false),
+      dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u),
+      fromTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/u)
+    }).parse(req.body ?? {});
+    res.json(await startAmeriaScheduler({ force: true, ...params }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+adminRouter.post('/scheduler/stop', async (_req, res, next) => {
+  try {
+    res.json(await stopAmeriaScheduler());
+  } catch (error) {
+    next(error);
+  }
 });
 adminRouter.get('/overview', async (_req, res, next) => {
   try {

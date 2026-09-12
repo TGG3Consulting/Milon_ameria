@@ -2,8 +2,11 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { getAmeriaStatus, getAmeriaToken } from '../services/ameriaClient.js';
 import { syncAmeriaTransactions } from '../services/syncService.js';
+import { requireBitrixSession } from '../services/bitrixSession.js';
 
 export const ameriaRouter = Router();
+
+ameriaRouter.use(requireBitrixSession);
 
 ameriaRouter.get('/status', async (_req, res, next) => {
   try {

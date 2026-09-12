@@ -1347,11 +1347,15 @@ function DealDetailsModal({ deal, onClose }) {
             <h2 id="deal-details-title">{deal.buyerName || deal.title || `Deal #${deal.id}`}</h2>
           </div>
           <div className="deal-details-actions">
-            {deal.bitrixUrl ? (
-              <a className="secondary bitrix-link-button" href={deal.bitrixUrl} target="_blank" rel="noreferrer">
+            {deal.id ? (
+              <button
+                className="secondary bitrix-link-button"
+                type="button"
+                onClick={() => openBitrixDeal(deal.id)}
+              >
                 <ExternalLink size={16} />
                 Bitrix
-              </a>
+              </button>
             ) : null}
             <button className="secondary icon-button" type="button" onClick={onClose} aria-label="Close">
               <X size={18} />
@@ -1436,6 +1440,14 @@ function DealDetailsModal({ deal, onClose }) {
       </section>
     </div>
   );
+}
+
+function openBitrixDeal(dealId) {
+  const path = `/crm/deal/details/${encodeURIComponent(dealId)}/`;
+
+  if (window.BX24?.openPath) {
+    window.BX24.openPath(path);
+  }
 }
 
 function formatMoney(amount, currency) {

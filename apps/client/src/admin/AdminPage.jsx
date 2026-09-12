@@ -36,9 +36,11 @@ const defaultSyncFrom = '2026-01-01';
 
 const initialScheduler = {
   running: false,
+  enabled: false,
   startedAt: null,
   intervalMs: 300000,
-  fromDate: ''
+  fromDate: '',
+  fromTime: '00:00'
 };
 
 export default function AdminPage() {
@@ -59,6 +61,7 @@ export default function AdminPage() {
   const [schedulerBusy, setSchedulerBusy] = useState(false);
   const [actionsOpen, setActionsOpen] = useState(false);
   const [syncDateFrom, setSyncDateFrom] = useState(defaultSyncFrom);
+  const [syncTimeFrom, setSyncTimeFrom] = useState('00:00');
 
   const loadAdminData = useCallback(async (accessToken = token) => {
     if (!accessToken) return;
@@ -77,6 +80,8 @@ export default function AdminPage() {
       setReceiptSummary(nextReceipts.summary ?? []);
       setReceipts(nextReceipts.receipts ?? []);
       setScheduler(nextScheduler);
+      if (nextScheduler.fromDate) setSyncDateFrom(nextScheduler.fromDate);
+      if (nextScheduler.fromTime) setSyncTimeFrom(nextScheduler.fromTime);
     } catch (nextError) {
       setError(nextError.message);
     }
@@ -94,7 +99,7 @@ export default function AdminPage() {
     setToken(nextToken);
   }
 
-  async function handleSyncNow(params = { dateFrom: syncDateFrom }) {
+  async function handleSyncNow(params = { dateFrom: syncDateFrom, fromTime: syncTimeFrom }) {
     if (!window.confirm('Ստանալ Ameriabank-ի նոր կտրոնները հիմա՞')) return;
 
     setSyncing(true);
@@ -121,7 +126,7 @@ export default function AdminPage() {
     setError('');
     try {
       const next = action === 'start'
-        ? await startAdminScheduler(token)
+        ? await startAdminScheduler(token, { dateFrom: syncDateFrom, fromTime: syncTimeFrom })
         : await stopAdminScheduler(token);
       setScheduler(next);
     } catch (nextError) {
@@ -222,10 +227,12 @@ export default function AdminPage() {
           scheduler={scheduler}
           syncDateFrom={syncDateFrom}
           setSyncDateFrom={setSyncDateFrom}
+          syncTimeFrom={syncTimeFrom}
+          setSyncTimeFrom={setSyncTimeFrom}
           busy={schedulerBusy}
           syncing={syncing}
           onClose={() => setActionsOpen(false)}
-          onSync={handleSyncNow}
+          onSync={() => handleSyncNow()}
           onStart={() => handleScheduler('start')}
           onStop={() => handleScheduler('stop')}
         />
@@ -234,7 +241,7 @@ export default function AdminPage() {
   );
 }
 
-function AmeriaActionsModal({ scheduler, syncDateFrom, setSyncDateFrom, busy, syncing, onClose, onSync, onStart, onStop }) {
+function AmeriaActionsModal({ scheduler, syncDateFrom, setSyncDateFrom, syncTimeFrom, setSyncTimeFrom, busy, syncing, onClose, onSync, onStart, onStop }) {
   return (
     <div className="admin-modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section className="admin-modal" role="dialog" aria-modal="true" aria-labelledby="ameria-actions-title">
@@ -245,13 +252,16 @@ function AmeriaActionsModal({ scheduler, syncDateFrom, setSyncDateFrom, busy, sy
           </div>
           <button className="admin-icon-button" type="button" onClick={onClose} aria-label="Փակել"><X size={18} /></button>
         </div>
-        <div className="admin-date-fields admin-date-fields-single">
+        <div className="admin-date-fields">
           <label>Սկսած
             <input type="date" value={syncDateFrom} onChange={(event) => setSyncDateFrom(event.target.value)} />
           </label>
+          <label>Ժամը
+            <input type="time" value={syncTimeFrom} onChange={(event) => setSyncTimeFrom(event.target.value)} />
+          </label>
         </div>        <p className="admin-modal-status">
           Scheduler՝ <strong>{scheduler.running ? 'աշխատում է' : 'կանգնած է'}</strong>
-          {scheduler.fromDate ? ' · սկսած ' + scheduler.fromDate : ''}
+          {scheduler.fromDate ? ' · սկսած ' + scheduler.fromDate + ' ' + (scheduler.fromTime ?? '00:00') : ''}
         </p>
         <div className="admin-modal-actions">
           <button className="admin-sync-button" type="button" onClick={onSync} disabled={syncing}>

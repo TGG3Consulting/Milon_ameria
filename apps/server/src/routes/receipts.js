@@ -1,8 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { confirmMatch, importBankTransaction, listBuildingOptions, listReceipts, searchDeals, undoMatch } from '../services/matchEngine.js';
+import { requireBitrixSession } from '../services/bitrixSession.js';
 
 export const receiptsRouter = Router();
+
+receiptsRouter.use(requireBitrixSession);
 
 receiptsRouter.get('/', async (_req, res, next) => {
   try {

@@ -2,6 +2,11 @@ import axios from 'axios';
 import { Agent } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { env } from '../config/env.js';
+import { getCurrentBitrixSession } from './bitrixContext.js';
+import { assertAllowedBitrixDomain } from './bitrixDomain.js';
+import { updateBitrixSession } from './bitrixSession.js';
+
+export { assertAllowedBitrixDomain } from './bitrixDomain.js';
 
 const BITRIX_MAX_CONCURRENT_REQUESTS = 2;
 const sharedWebhookAgent = new Agent({
@@ -24,8 +29,8 @@ export function createBitrixClient(domain, accessToken) {
   });
 }
 
-export async function exchangeBitrixCode({ code, domain, clientId, clientSecret, redirectUri }) {
-  const { data } = await axios.get(`https://${domain}/oauth/token/`, {
+export async function exchangeBitrixCode({ code, clientId, clientSecret, redirectUri }) {
+  const { data } = await axios.get('https://oauth.bitrix.info/oauth/token/', {
     params: {
       grant_type: 'authorization_code',
       client_id: clientId,
@@ -36,24 +41,6 @@ export async function exchangeBitrixCode({ code, domain, clientId, clientSecret,
   });
 
   return data;
-}
-
-export function assertAllowedBitrixDomain(domain) {
-  const normalizedDomain = String(domain ?? '').trim().toLowerCase();
-  const configuredDomains = String(env.BITRIX_ALLOWED_DOMAINS ?? '')
-    .split(',')
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
-  const webhookDomain = env.BITRIX_WEBHOOK_URL ? new URL(env.BITRIX_WEBHOOK_URL).hostname.toLowerCase() : null;
-  const allowedDomains = new Set([...configuredDomains, webhookDomain].filter(Boolean));
-
-  if (!/^[a-z0-9.-]+$/.test(normalizedDomain) || !allowedDomains.has(normalizedDomain)) {
-    const error = new Error('Bitrix domain is not allowed');
-    error.status = 400;
-    throw error;
-  }
-
-  return normalizedDomain;
 }
 
 export function createBitrixWebhookClient() {
@@ -75,10 +62,12 @@ export function getBitrixStatus() {
 }
 
 export async function callBitrixMethodResponse(method, params = {}) {
-  const client = createBitrixWebhookClient();
+  const session = getCurrentBitrixSession();
+  let auth = session?.auth ?? null;
+  let client = auth ? createOAuthBitrixClient(auth) : createBitrixWebhookClient();
 
   if (!client) {
-    throw new Error('BITRIX_WEBHOOK_URL is not configured');
+    throw new Error(auth ? 'Bitrix OAuth client is not configured' : 'BITRIX_WEBHOOK_URL is not configured');
   }
 
   let data;
@@ -87,6 +76,7 @@ export async function callBitrixMethodResponse(method, params = {}) {
   const timeout = readOnly ? Math.min(env.BITRIX_REQUEST_TIMEOUT_MS, 20000) : env.BITRIX_REQUEST_TIMEOUT_MS;
   const priority = method.endsWith('.get') || !readOnly ? 'high' : 'regular';
   const started = Date.now();
+  let refreshed = false;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     // Retrying a read uses a fresh socket instead of a potentially broken pooled one.
@@ -111,6 +101,16 @@ export async function callBitrixMethodResponse(method, params = {}) {
       }
       break;
     } catch (error) {
+      if (auth && !refreshed && isExpiredBitrixToken(error) && auth.refreshToken) {
+        const refreshedAuth = await refreshBitrixAuth(auth);
+        auth = refreshedAuth;
+        client = createOAuthBitrixClient(auth);
+        if (session) updateBitrixSession(session, auth);
+        refreshed = true;
+        attempt = 0;
+        continue;
+      }
+
       const code = String(error.code ?? '');
       const isTimeout = ['ECONNABORTED', 'ETIMEDOUT', 'ERR_CANCELED'].includes(code);
       const transient = isTimeout || ['ECONNRESET', 'EPIPE', 'EAI_AGAIN'].includes(code)
@@ -155,6 +155,39 @@ export async function callBitrixMethodResponse(method, params = {}) {
   }
 
   return data;
+}
+
+async function refreshBitrixAuth(auth) {
+  const { data } = await axios.get('https://oauth.bitrix.info/oauth/token/', {
+    params: {
+      grant_type: 'refresh_token',
+      client_id: env.BITRIX_CLIENT_ID,
+      client_secret: env.BITRIX_CLIENT_SECRET,
+      refresh_token: auth.refreshToken
+    }
+  });
+
+  if (!data?.access_token || !data?.refresh_token) {
+    const error = new Error(data?.error_description ?? data?.error ?? 'Bitrix refresh response is incomplete');
+    error.status = 401;
+    throw error;
+  }
+
+  return {
+    ...auth,
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresIn: Number(data.expires_in) > 0 ? Number(data.expires_in) : 3600,
+    clientEndpoint: data.client_endpoint ?? auth.clientEndpoint,
+    serverEndpoint: data.server_endpoint ?? auth.serverEndpoint,
+    domain: assertAllowedBitrixDomain(data.domain ?? auth.domain),
+    scope: data.scope ?? auth.scope,
+    userId: String(data.user_id ?? auth.userId)
+  };
+}
+
+function isExpiredBitrixToken(error) {
+  return error.response?.status === 401 && error.response?.data?.error === 'expired_token';
 }
 
 export async function callBitrixMethod(method, params = {}) {
@@ -238,6 +271,15 @@ function scheduleBitrixRequest(task, priority) {
     const queue = priority === 'high' ? priorityQueue : regularQueue;
     queue.push({ task, resolve, reject });
     drainBitrixQueue();
+  });
+}
+
+function createOAuthBitrixClient(auth) {
+  return axios.create({
+    baseURL: auth.clientEndpoint.endsWith('/') ? auth.clientEndpoint : `${auth.clientEndpoint}/`,
+    timeout: env.BITRIX_REQUEST_TIMEOUT_MS,
+    params: { auth: auth.accessToken },
+    httpsAgent: sharedWebhookAgent
   });
 }
 

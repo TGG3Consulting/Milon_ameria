@@ -32,7 +32,7 @@ export function getAdminScheduler(token) {
   return request('/api/admin/scheduler', token);
 }
 
-export async function startAdminScheduler(token, params = {}) {
+export async function startAdminScheduler(token, params) {
   const response = await fetch(API_BASE_URL + '/api/admin/scheduler/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
