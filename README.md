@@ -44,3 +44,16 @@ For the server-side Local Application, configure these Bitrix24 URLs after deplo
 The application accepts Bitrix24 authorization only through the signed installation/session flow. Direct browser access to the handler is rejected, API routes require the Bitrix session, and Bitrix deal navigation uses the in-portal `BX24.openPath` method.
 
 Set `BITRIX_SESSION_SECRET` to a long random value in the production `.env`. Do not commit `BITRIX_CLIENT_SECRET`, `BITRIX_APPLICATION_TOKEN`, access tokens, refresh tokens, webhook URLs, or other secrets.
+
+## Production update
+
+The production service starts the compiled server from `apps/server/dist`, so rebuild after pulling source changes before restarting systemd:
+
+```bash
+cd /var/www/milon-ameria
+git pull --ff-only origin main
+npm ci
+npm run build
+sudo systemctl restart milon-ameria
+sudo systemctl status milon-ameria --no-pager
+```

@@ -66,8 +66,9 @@ const DEAL_FIELDS = {
   contactId: 'CONTACT_ID',
   receiptIds: 'UF_CRM_1785744431',
   scheduleIds: 'UF_CRM_1785062378',
-  balance: 'UF_CRM_1776322253480',
-  paidTotal: 'UF_CRM_1776609678581',
+  // Bitrix metadata: double, precision 2 (the retired fields were money).
+  balance: 'UF_CRM_1789311290719',
+  paidTotal: 'UF_CRM_1789311265873',
   buyerName: 'UF_CRM_1716720255166',
   apartmentChecked: 'UF_CRM_1776254518',
   apartmentNumber: 'UF_CRM_65BE4878488D4',
@@ -1193,8 +1194,8 @@ export function getDealScheduleSummaryFields(schedules, amdTotal) {
 
   return {
     [DEAL_FIELDS.scheduleIds]: schedules.map((schedule) => schedule.id),
-    [DEAL_FIELDS.balance]: formatMoneyField(scheduleTotal - amdTotal),
-    [DEAL_FIELDS.paidTotal]: formatMoneyField(amdTotal)
+    [DEAL_FIELDS.balance]: formatSummaryAmount(scheduleTotal - amdTotal),
+    [DEAL_FIELDS.paidTotal]: formatSummaryAmount(amdTotal)
   };
 }
 
@@ -1219,30 +1220,36 @@ async function getDealFields(dealId) {
 
 export function assertDealScheduleSummaryPersisted(deal, expectedFields) {
   const mismatches = [DEAL_FIELDS.balance, DEAL_FIELDS.paidTotal].filter(
-    (field) => normalizeMoneyField(deal?.[field]) !== normalizeMoneyField(expectedFields?.[field])
+    (field) => normalizeSummaryAmount(deal?.[field]) !== normalizeSummaryAmount(expectedFields?.[field])
   );
 
   if (mismatches.length) {
     const error = new Error(
-      `Bitrix automation overwrote deal summary fields after save: ${mismatches.join(', ')}`
+      `Bitrix deal summary fields were not persisted as requested: ${mismatches.join(', ')}`
     );
     error.status = 409;
-    error.code = 'BITRIX_AUTOMATION_CONFLICT';
+    error.code = 'BITRIX_SUMMARY_NOT_PERSISTED';
     throw error;
   }
 }
 
-function normalizeMoneyField(value) {
-  const [amount = '0', currency = 'AMD'] = String(value ?? '').split('|');
-  return `${Number(amount) || 0}|${String(currency || 'AMD').toUpperCase()}`;
+function normalizeSummaryAmount(value) {
+  // A missing value is not a saved zero. Double fields may be returned as strings.
+  if (typeof value !== 'number' && typeof value !== 'string') return NaN;
+  if (typeof value === 'string' && value.trim() === '') return NaN;
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount : NaN;
 }
 
 function sumScheduleAmounts(schedules) {
   return schedules.reduce((sum, schedule) => sum + Number(schedule.amount ?? 0), 0);
 }
 
-function formatMoneyField(amount, currency = 'AMD') {
-  return `${Number(amount ?? 0)}|${currency}`;
+function formatSummaryAmount(value) {
+  const amount = normalizeSummaryAmount(value);
+  if (!Number.isFinite(amount)) throw new Error('Invalid deal summary amount');
+  // Both target fields have PRECISION=2 and accept a number without a currency suffix.
+  return Number(amount.toFixed(2));
 }
 
 export function sumAmdVouchers(vouchers) {

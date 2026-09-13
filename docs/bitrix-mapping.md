@@ -11,6 +11,23 @@ The app uses Bitrix24 as the main storage and reads all operational data from Bi
 - Deal field `UF_CRM_1785744431` stores linked receipt IDs and must be appended to, not overwritten
 - Receipt field `contactId` stores the matched deal contact
 
+## Deal payment totals
+
+Verified with `crm.deal.fields` and `crm.item.fields` on 2026-09-13:
+
+- `UF_CRM_1789311265873` — paid total, type `double`, precision `2`.
+- `UF_CRM_1789311290719` — remaining balance, type `double`, precision `2`.
+
+Send numeric AMD amounts (for example `8700000`), not money strings such as
+`8700000|AMD`. The retired fields `UF_CRM_1776609678581` and
+`UF_CRM_1776322253480` have type `money`; the integration no longer writes them.
+Existing values in those retired fields are not cleared or migrated automatically.
+The summary is recalculated during receipt matching/unmatching, not by a restart.
+
+The update is read back to verify the two numeric totals. Empty, missing, or invalid
+values are a persistence failure, including when the expected total is zero.
+A mismatch alone does not establish that Bitrix automation caused it.
+
 ## Receipt Fields `1056`
 
 - `xmlId` - bank transaction id, used for duplicate prevention

@@ -37,7 +37,7 @@ test('uses the voucher custom amount before stale opportunity', () => {
   assert.equal(total, 20000000);
 });
 
-test('writes deal totals only to the confirmed production fields', () => {
+test('writes numeric deal totals to the double fields confirmed by Bitrix metadata', () => {
   const fields = getDealScheduleSummaryFields(
     [makeSchedule(839, 10400000), makeSchedule(841, 10400000), makeSchedule(843, 10400000), makeSchedule(845, 10400000)],
     20760000
@@ -45,24 +45,67 @@ test('writes deal totals only to the confirmed production fields', () => {
 
   assert.deepEqual(fields, {
     UF_CRM_1785062378: ['839', '841', '843', '845'],
-    UF_CRM_1776322253480: '20840000|AMD',
-    UF_CRM_1776609678581: '20760000|AMD'
+    UF_CRM_1789311290719: 20840000,
+    UF_CRM_1789311265873: 20760000
   });
   assert.equal('UF_CRM_1785062920' in fields, false);
   assert.equal('UF_CRM_1785062958' in fields, false);
+  assert.equal('UF_CRM_1776322253480' in fields, false);
+  assert.equal('UF_CRM_1776609678581' in fields, false);
 });
 
-test('detects when Bitrix automation overwrites a saved deal total', () => {
+test('detects a deal total that was not persisted without assuming automation caused it', () => {
   const expected = {
-    UF_CRM_1776322253480: '20840000|AMD',
-    UF_CRM_1776609678581: '20760000|AMD'
+    UF_CRM_1789311290719: 20840000,
+    UF_CRM_1789311265873: 20760000
   };
 
   assert.doesNotThrow(() => assertDealScheduleSummaryPersisted(expected, expected));
   assert.throws(
-    () => assertDealScheduleSummaryPersisted({ ...expected, UF_CRM_1776609678581: null }, expected),
-    (error) => error.status === 409 && error.code === 'BITRIX_AUTOMATION_CONFLICT'
+    () => assertDealScheduleSummaryPersisted({ ...expected, UF_CRM_1789311265873: null }, expected),
+    (error) => error.status === 409 && error.code === 'BITRIX_SUMMARY_NOT_PERSISTED'
   );
+});
+
+test('accepts numeric strings returned by Bitrix for double fields', () => {
+  assert.doesNotThrow(() => assertDealScheduleSummaryPersisted({
+    UF_CRM_1789311290719: '29300000.00',
+    UF_CRM_1789311265873: '8700000.00'
+  }, {
+    UF_CRM_1789311290719: 29300000,
+    UF_CRM_1789311265873: 8700000
+  }));
+});
+
+test('blank or invalid persisted totals cannot pass as zero', () => {
+  const expected = getDealScheduleSummaryFields([], 0);
+  for (const field of ['UF_CRM_1789311290719', 'UF_CRM_1789311265873']) {
+    for (const invalid of [undefined, null, '', ' ', false, [], {}, 'invalid', '0|AMD', NaN, Infinity]) {
+      assert.throws(
+        () => assertDealScheduleSummaryPersisted({ ...expected, [field]: invalid }, expected),
+        { code: 'BITRIX_SUMMARY_NOT_PERSISTED' }
+      );
+    }
+  }
+  assert.doesNotThrow(() => assertDealScheduleSummaryPersisted({
+    UF_CRM_1789311290719: '0.00', UF_CRM_1789311265873: 0
+  }, expected));
+});
+
+test('formats double totals to the two decimal places configured in Bitrix', () => {
+  const fields = getDealScheduleSummaryFields([makeSchedule(1, 0.1), makeSchedule(2, 0.2)], 0.1);
+  assert.equal(fields.UF_CRM_1789311290719, 0.2);
+  assert.equal(fields.UF_CRM_1789311265873, 0.1);
+  assert.doesNotThrow(() => assertDealScheduleSummaryPersisted({
+    UF_CRM_1789311290719: '0.20', UF_CRM_1789311265873: '0.10'
+  }, fields));
+});
+
+test('rejects non-finite totals before sending a CRM summary update', () => {
+  for (const invalid of [NaN, Infinity, -Infinity]) {
+    assert.throws(() => getDealScheduleSummaryFields([], invalid), /Invalid deal summary amount/u);
+    assert.throws(() => getDealScheduleSummaryFields([makeSchedule(1, invalid)], 0), /Invalid deal summary amount/u);
+  }
 });
 
 test('does not suggest a deal with a different explicit apartment number', () => {
