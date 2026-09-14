@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertDealReceiptIdsPersisted,
   assertDealScheduleSummaryPersisted,
   dealMatchesReceipt,
   filterDealsForSearch,
@@ -8,10 +9,26 @@ import {
   getDefaultStages,
   parsePurpose,
   planScheduleUpdates,
+  serializeBitrixMultipleField,
   sumAmdVouchers
 } from '../src/services/matchEngine.js';
 
 const stages = getDefaultStages();
+
+test('uses an explicit blank value to clear the last linked receipt in Bitrix', () => {
+  assert.deepEqual(serializeBitrixMultipleField([]), ['']);
+  assert.deepEqual(serializeBitrixMultipleField(null), ['']);
+  assert.deepEqual(serializeBitrixMultipleField(['901', '902']), ['901', '902']);
+});
+
+test('detects when Bitrix accepts a receipt-link update without clearing the old value', () => {
+  assert.doesNotThrow(() => assertDealReceiptIdsPersisted({ UF_CRM_1785744431: false }, []));
+  assert.doesNotThrow(() => assertDealReceiptIdsPersisted({ UF_CRM_1785744431: ['902', '901'] }, ['901', '902']));
+  assert.throws(
+    () => assertDealReceiptIdsPersisted({ UF_CRM_1785744431: ['901'] }, []),
+    { status: 409, code: 'BITRIX_RECEIPT_LINKS_NOT_PERSISTED' }
+  );
+});
 
 function makeSchedule(id, amount, status = stages.schedule.unpaid) {
   return { id: String(id), amount, status, remaining: amount, partialPaid: 0 };

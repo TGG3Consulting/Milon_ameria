@@ -5,6 +5,7 @@ import { parsePurposeV2 } from './purposePatternsV2.js';
 import { canonicalizeNumeric, smartFindValue } from './smartMatch.js';
 import { normalizeBankTransaction } from './transactionValidation.js';
 import { BUILDING_OPTIONS, findProjects, getProjectById, resolveProject } from './projectMapping.js';
+import { runWithKeyedLock } from './keyedLock.js';
 
 const TYPES = {
   voucher: {
@@ -102,6 +103,7 @@ const RECENT_DEALS_CACHE_TTL_MS = 30000;
 const RECENT_DEALS_STALE_TTL_MS = 300000;
 const receiptImportLocks = new Map();
 const matchLocks = new Map();
+const dealLocks = new Map();
 let stagesPromise = null;
 let receiptBoardLoadPromise = null;
 let recentDealsPromise = null;
@@ -344,38 +346,17 @@ export async function listBuildingOptions() {
 export async function confirmMatch(payload) {
   const receiptId = String(payload.receiptId);
   const dealId = String(payload.dealId);
-  const previous = matchLocks.get(receiptId);
+  const alreadyProcessing = matchLocks.has(receiptId);
+  const result = await runWithKeyedLock(matchLocks, receiptId, () =>
+    runWithKeyedLock(dealLocks, dealId, () => confirmMatchOnce(payload))
+  );
 
-  if (previous) {
-    return previous.promise.then((result) => {
-      if (String(result.matchedDealId) === dealId) {
-        return { ...result, alreadyProcessing: true };
-      }
-
-      return confirmMatchOnce(payload);
-    });
-  }
-
-  const matchPromise = confirmMatchOnce(payload).finally(() => {
-    matchLocks.delete(receiptId);
-  });
-  matchLocks.set(receiptId, { dealId, promise: matchPromise });
-  return matchPromise;
+  return alreadyProcessing ? { ...result, alreadyProcessing: true } : result;
 }
 
 export async function undoMatch(payload) {
   const receiptId = String(payload.receiptId);
-  const previous = matchLocks.get(receiptId);
-
-  if (previous) {
-    return previous.promise.then(() => undoMatchOnce(payload));
-  }
-
-  const undoPromise = undoMatchOnce(payload).finally(() => {
-    matchLocks.delete(receiptId);
-  });
-  matchLocks.set(receiptId, { dealId: null, promise: undoPromise });
-  return undoPromise;
+  return runWithKeyedLock(matchLocks, receiptId, () => undoMatchOnce(payload));
 }
 
 async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
@@ -410,9 +391,7 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
   let receiptUpdated = false;
 
   try {
-    await updateDealFields(dealId, {
-      [DEAL_FIELDS.receiptIds]: receiptIds
-    });
+    await updateDealReceiptIds(dealId, receiptIds);
     dealUpdated = true;
 
     await callBitrixMethod('crm.item.update', {
@@ -456,9 +435,8 @@ async function confirmMatchOnce({ receiptId, dealId, scheduleIds = [] }) {
       }).catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
     if (dealUpdated) {
-      await updateDealFields(dealId, {
-        [DEAL_FIELDS.receiptIds]: previousReceiptIds
-      }).catch((rollbackError) => rollbackErrors.push(rollbackError));
+      await updateDealReceiptIds(dealId, previousReceiptIds)
+        .catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
 
     if (rollbackErrors.length) {
@@ -479,6 +457,16 @@ async function undoMatchOnce({ receiptId, dealId: requestedDealId }) {
 
   assertUndoEntities({ receipt, receiptId, dealId, linkedDealId, stages });
 
+  return runWithKeyedLock(dealLocks, dealId, () => undoMatchForDeal({
+    receipt,
+    receiptId,
+    dealId,
+    linkedDealId,
+    stages
+  }));
+}
+
+async function undoMatchForDeal({ receipt, receiptId, dealId, linkedDealId, stages }) {
   const deal = await getBitrixDeal(dealId);
   const previousReceiptIds = deal?.[DEAL_FIELDS.receiptIds] ?? [];
   const receiptIds = removeId(previousReceiptIds, receiptId);
@@ -492,9 +480,7 @@ async function undoMatchOnce({ receiptId, dealId: requestedDealId }) {
   let receiptUpdated = false;
 
   try {
-    await updateDealFields(dealId, {
-      [DEAL_FIELDS.receiptIds]: receiptIds
-    });
+    await updateDealReceiptIds(dealId, receiptIds);
     dealUpdated = true;
 
     if (shouldUpdateReceipt) {
@@ -538,9 +524,8 @@ async function undoMatchOnce({ receiptId, dealId: requestedDealId }) {
       }).catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
     if (dealUpdated) {
-      await updateDealFields(dealId, {
-        [DEAL_FIELDS.receiptIds]: previousReceiptIds
-      }).catch((rollbackError) => rollbackErrors.push(rollbackError));
+      await updateDealReceiptIds(dealId, previousReceiptIds)
+        .catch((rollbackError) => rollbackErrors.push(rollbackError));
     }
 
     if (rollbackErrors.length) {
@@ -1095,6 +1080,14 @@ function removeId(value, id) {
   return normalizeIdList(value).filter((item) => item !== normalizedId);
 }
 
+export function serializeBitrixMultipleField(value) {
+  const ids = normalizeIdList(value);
+
+  // Bitrix may accept [] for a multiple custom field without clearing the stored value.
+  // A non-empty array containing a blank value makes the intended reset explicit.
+  return ids.length ? ids : [''];
+}
+
 function normalizeIdList(value) {
   if (value === false || value === null || value === undefined || value === '') {
     return [];
@@ -1130,7 +1123,7 @@ async function recalculateDealSchedules(deal, stages, linkedReceiptIds = [], opt
       throw failed.reason;
     }
 
-    await updateDealScheduleSummary(dealId, schedules, amdTotal);
+    await updateDealScheduleSummary(dealId, schedules, amdTotal, linkedReceiptIds);
   } catch (error) {
     const rollbackErrors = [];
     for (const schedule of completed.reverse()) {
@@ -1178,13 +1171,14 @@ async function listDealSchedulesForRecalculation(deal) {
   return items.map(mapSchedule).sort((left, right) => Number(left.id) - Number(right.id));
 }
 
-async function updateDealScheduleSummary(dealId, schedules, amdTotal) {
+async function updateDealScheduleSummary(dealId, schedules, amdTotal, linkedReceiptIds) {
   const fields = getDealScheduleSummaryFields(schedules, amdTotal);
 
   const result = await updateDealFields(dealId, fields);
   const persisted = await getDealFields(dealId);
 
   assertDealScheduleSummaryPersisted(persisted, fields);
+  assertDealReceiptIdsPersisted(persisted, linkedReceiptIds);
 
   return result;
 }
@@ -1205,6 +1199,12 @@ function updateDealFields(dealId, fields) {
     id: dealId,
     useOriginalUfNames: 'Y',
     fields
+  });
+}
+
+function updateDealReceiptIds(dealId, receiptIds) {
+  return updateDealFields(dealId, {
+    [DEAL_FIELDS.receiptIds]: serializeBitrixMultipleField(receiptIds)
   });
 }
 
@@ -1231,6 +1231,22 @@ export function assertDealScheduleSummaryPersisted(deal, expectedFields) {
     error.code = 'BITRIX_SUMMARY_NOT_PERSISTED';
     throw error;
   }
+}
+
+export function assertDealReceiptIdsPersisted(deal, expectedReceiptIds) {
+  const actual = [...new Set(normalizeIdList(deal?.[DEAL_FIELDS.receiptIds]))].sort(compareIds);
+  const expected = [...new Set(normalizeIdList(expectedReceiptIds))].sort(compareIds);
+
+  if (actual.length !== expected.length || actual.some((id, index) => id !== expected[index])) {
+    const error = new Error('Bitrix deal receipt links were not persisted as requested');
+    error.status = 409;
+    error.code = 'BITRIX_RECEIPT_LINKS_NOT_PERSISTED';
+    throw error;
+  }
+}
+
+function compareIds(left, right) {
+  return Number(left) - Number(right);
 }
 
 function normalizeSummaryAmount(value) {
