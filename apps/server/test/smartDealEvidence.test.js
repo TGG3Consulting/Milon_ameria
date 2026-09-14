@@ -83,11 +83,11 @@ test('V2 name evidence accepts reordered full names but rejects one shared token
       area: ''
     });
     const reordered = getSmartDealEvidence(
-      receipt('Payment apartment 55', 'Armen Sargsyan'),
+      receipt('Payment building 9 apartment 55', 'Armen Sargsyan'),
       baseDeal
     );
     const sharedFirstName = getSmartDealEvidence(
-      receipt('Payment apartment 55', 'Armen Petrosyan'),
+      receipt('Payment building 9 apartment 55', 'Armen Petrosyan'),
       baseDeal
     );
 

@@ -137,6 +137,44 @@ for (const v2 of [false, true]) {
   });
 }
 
+for (const v2 of [false, true]) {
+  test(`apartment without a building suggests matching deals from every project (V2=${v2})`, () => {
+    const previous = env.SMART_MATCH_V2;
+    env.SMART_MATCH_V2 = v2;
+
+    try {
+      const purpose = 'Payment for apartment 55';
+      const receipt = { purpose, parsed: (v2 ? parsePurposeV2 : parsePurpose)(purpose) };
+      const matchingProjects = projects
+        .filter(({ id }) => dealMatchesReceipt(receipt, makeDeal(id)))
+        .map(({ id }) => id);
+
+      assert.deepEqual(matchingProjects, projects.map(({ id }) => id));
+      assert.equal(dealMatchesReceipt(receipt, makeDeal('1507', { apartmentNumber: '56' })), false);
+
+      if (v2) {
+        for (const { id } of projects) {
+          assert.equal(getSmartDealEvidence(receipt, makeDeal(id)).matched, true);
+        }
+      }
+    } finally {
+      env.SMART_MATCH_V2 = previous;
+    }
+  });
+}
+
+test('an explicit building still scopes an apartment match', () => {
+  const receipt = {
+    purpose: 'Payment for building 5, apartment 55',
+    parsed: parsePurposeV2('Payment for building 5, apartment 55')
+  };
+  const buildingFive = makeDeal('1505', { searchableText: 'building 5 apartment 55' });
+  const buildingSeven = makeDeal('1503', { searchableText: 'building 7 apartment 55' });
+
+  assert.equal(dealMatchesReceipt(receipt, buildingFive), true);
+  assert.equal(dealMatchesReceipt(receipt, buildingSeven), false);
+});
+
 test('CRM enum takes precedence over old text, with aliases available when the enum is missing', () => {
   const purpose = 'Միլոն Պլազա համալիր, բն. 55';
   const receipt = { purpose, parsed: parsePurpose(purpose) };
@@ -174,9 +212,10 @@ test('receipt suggestions apply project mapping to direct and contact matches wi
       calls.push(method);
       let result;
       if (method === 'crm.item.list.json') {
-        const items = params.entityTypeId === 1056 ? ['', 'AB1234567'].map((document, index) => ({
+        const scopedPurpose = 'Котайкская область, г. Абовян, площадь Барекамутяна, 5/1, квартира 55';
+        const items = params.entityTypeId === 1056 ? ['', 'AB1234567', ''].map((document, index) => ({
           id: index + 1, stageId: 'DT1056_35:NEW',
-          ufCrm19_1785738531: 'Котайкская область, г. Абовян, площадь Барекамутяна, 5/1, квартира 55',
+          ufCrm19_1785738531: index === 2 ? 'Payment for apartment 55' : scopedPurpose,
           ufCrm19_1785737495: document
         })) : [];
         result = { items: params.order?.id === 'DESC' ? items.reverse() : items };
@@ -197,12 +236,18 @@ test('receipt suggestions apply project mapping to direct and contact matches wi
     for (const v2 of [false, true]) {
       env.SMART_MATCH_V2 = v2;
       const { unmatched } = await listReceipts();
-      assert.equal(unmatched.length, 2);
-      for (const receipt of unmatched) {
+      assert.equal(unmatched.length, 3);
+      const scopedReceipts = unmatched.filter((receipt) => receipt.parsed.project);
+      for (const receipt of scopedReceipts) {
         assert.equal(receipt.parsed.project, 'Milon Tower');
         assert.deepEqual(receipt.suggestions.map(({ deal }) => deal.projectId), ['1507']);
       }
-      const directReceipt = unmatched.find((receipt) => !receipt.payerDocument);
+      const apartmentOnlyReceipt = unmatched.find((receipt) => !receipt.parsed.project);
+      assert.deepEqual(
+        apartmentOnlyReceipt.suggestions.map(({ deal }) => deal.projectId).sort(),
+        projects.map(({ id }) => id).sort()
+      );
+      const directReceipt = scopedReceipts.find((receipt) => !receipt.payerDocument);
       const contactReceipt = unmatched.find((receipt) => receipt.payerDocument);
       assert.equal(directReceipt.suggestions[0].label, 'Deal Match');
       assert.equal(contactReceipt.suggestions[0].label, 'Contact Match');

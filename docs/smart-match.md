@@ -33,9 +33,11 @@ Fuzzy matching is structurally disabled for numeric identifiers. Runtime deal ev
 numeric fields to have their semantic anchor, so a bare `55` cannot become apartment 55 merely
 because it appears as an amount or reference number.
 
-A deal needs multiple independent signals, such as project + apartment or apartment + payer name.
-A common project alone is insufficient. If both sides explicitly contain different apartment
-numbers or different known projects, the candidate is rejected.
+A deal normally needs multiple independent signals, such as project + apartment or apartment +
+payer name. One intentional exception is an explicitly anchored apartment number with no building
+or project in the payment purpose: every deal with that exact structured apartment number is
+suggested across all buildings. A common project alone is insufficient. If both sides explicitly
+contain different apartment numbers or different known projects, the candidate is rejected.
 
 `smartFindBest()` compares candidate identities and requires a confidence margin. Equally strong
 different candidates return `null`; leading-zero aliases of the same numeric identifier do not

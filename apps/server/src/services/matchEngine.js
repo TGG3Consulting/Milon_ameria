@@ -1521,8 +1521,10 @@ export function dealMatchesReceipt(receipt, deal) {
   const projectMatches = projectEvidence.matched;
   const contractMatches = parsed.contractDate ? includesText(haystack, parsed.contractDate) : false;
   const payerMatches = receipt.payerName ? namesOverlap(receipt.payerName, deal.buyerName) : false;
+  const apartmentOnlyMatches = isUnscopedApartmentMatch(parsed, deal);
 
   return (
+    apartmentOnlyMatches ||
     (buildingMatches && apartmentMatches) ||
     (buildingMatches && preliminaryMatches) ||
     (projectMatches && (apartmentMatches || preliminaryMatches || areaMatches || contractMatches)) ||
@@ -1587,6 +1589,17 @@ function hasApartmentConflict(parsedApartment, deal) {
   );
 }
 
+function isUnscopedApartmentMatch(parsed, deal) {
+  return Boolean(
+    apartmentMatchesDeal(parsed?.apartment, deal) &&
+    !parsed?.building &&
+    !parsed?.project &&
+    // The legacy parser exposes a preliminary/contract number as `apartment` too. Do not let
+    // that compatibility fallback turn a contract identifier into an apartment-only match.
+    !parsed?.preliminaryNumber
+  );
+}
+
 function getProjectDealEvidence(receipt, deal) {
   // The CRM enum is authoritative; labels and addresses support older deals without it.
   const structuredProject = getProjectById(deal.projectId);
@@ -1635,10 +1648,12 @@ export function getSmartDealEvidence(receipt, deal) {
     canonicalizeNumeric(parsedApartment) !== canonicalizeNumeric(deal.apartmentNumber)
   );
   const conflict = apartmentConflict || projectEvidence.conflict;
+  const apartmentOnly = apartment && isUnscopedApartmentMatch(receipt.parsed, deal);
 
   const matched = Boolean(
     !conflict && (
       title ||
+      apartmentOnly ||
       (project && apartment) ||
       (apartment && name) ||
       (apartment && (floor || area)) ||
