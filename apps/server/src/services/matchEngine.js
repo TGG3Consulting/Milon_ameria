@@ -1083,9 +1083,7 @@ function removeId(value, id) {
 export function serializeBitrixMultipleField(value) {
   const ids = normalizeIdList(value);
 
-  // Bitrix may accept [] for a multiple custom field without clearing the stored value.
-  // A non-empty array containing a blank value makes the intended reset explicit.
-  return ids.length ? ids : [''];
+  return ids.length ? ids : false;
 }
 
 function normalizeIdList(value) {
@@ -1203,8 +1201,19 @@ function updateDealFields(dealId, fields) {
 }
 
 function updateDealReceiptIds(dealId, receiptIds) {
+  const value = serializeBitrixMultipleField(receiptIds);
+
+  if (value === false) {
+    return callBitrixMethod('crm.deal.update', {
+      id: dealId,
+      fields: {
+        [DEAL_FIELDS.receiptIds]: false
+      }
+    });
+  }
+
   return updateDealFields(dealId, {
-    [DEAL_FIELDS.receiptIds]: serializeBitrixMultipleField(receiptIds)
+    [DEAL_FIELDS.receiptIds]: value
   });
 }
 

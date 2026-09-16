@@ -4,7 +4,7 @@ import axios from 'axios';
 import { env } from '../src/config/env.js';
 import { getDefaultStages, resetStageCache, undoMatch } from '../src/services/matchEngine.js';
 
-test('clears the final receipt link with an explicit blank Bitrix value', async (t) => {
+test('clears the final receipt link through the Bitrix deal API', async (t) => {
   const previous = { ...env };
   env.BITRIX_WEBHOOK_URL = 'https://bitrix.example/rest/';
   env.BITRIX_REFRESH_STAGE_IDS = false;
@@ -29,7 +29,7 @@ test('clears the final receipt link with an explicit blank Bitrix value', async 
     contactId: null,
     stageId: stages.voucher.new
   };
-  const dealWrites = [];
+  const receiptLinkWrites = [];
 
   t.mock.method(axios, 'create', () => ({
     async post(method, params) {
@@ -41,13 +41,18 @@ test('clears the final receipt link with an explicit blank Bitrix value', async 
       } else if (method === 'crm.item.list.json') {
         assert.equal(params.entityTypeId, 1056);
         result = { items: [] };
+      } else if (method === 'crm.deal.update.json') {
+        assert.equal(String(params.id), deal.ID);
+        receiptLinkWrites.push(params.fields);
+        if (params.fields.UF_CRM_1785744431 === false) {
+          deal.UF_CRM_1785744431 = [];
+        } else {
+          Object.assign(deal, params.fields);
+        }
+        result = true;
       } else if (method === 'crm.item.update.json') {
         assert.equal(params.entityTypeId, 2);
-        dealWrites.push(params.fields);
         Object.assign(deal, params.fields);
-        if (params.fields.UF_CRM_1785744431) {
-          deal.UF_CRM_1785744431 = params.fields.UF_CRM_1785744431.filter(Boolean);
-        }
         result = { item: {} };
       } else {
         assert.fail(`Unexpected CRM call: ${method}`);
@@ -59,7 +64,7 @@ test('clears the final receipt link with an explicit blank Bitrix value', async 
 
   const result = await undoMatch({ receiptId: '901', dealId: '6653' });
 
-  assert.deepEqual(dealWrites[0], { UF_CRM_1785744431: [''] });
+  assert.deepEqual(receiptLinkWrites[0], { UF_CRM_1785744431: false });
   assert.deepEqual(deal.UF_CRM_1785744431, []);
   assert.equal(result.recalculation.amdTotal, 0);
 });

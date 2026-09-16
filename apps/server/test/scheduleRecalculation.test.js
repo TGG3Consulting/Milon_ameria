@@ -15,9 +15,9 @@ import {
 
 const stages = getDefaultStages();
 
-test('uses an explicit blank value to clear the last linked receipt in Bitrix', () => {
-  assert.deepEqual(serializeBitrixMultipleField([]), ['']);
-  assert.deepEqual(serializeBitrixMultipleField(null), ['']);
+test('serializes an empty multiple field as false for Bitrix legacy clearing', () => {
+  assert.equal(serializeBitrixMultipleField([]), false);
+  assert.equal(serializeBitrixMultipleField(null), false);
   assert.deepEqual(serializeBitrixMultipleField(['901', '902']), ['901', '902']);
 });
 
